@@ -1,16 +1,49 @@
-run =  ["gunicorn", "--bind", "0.0.0.0:5000", "main:app"]
-entrypoint = "main.py"
-modules = ["python-3.11"]
+# .replit for Split-Bill Bot (仿照成功的 To-Do Bot .replit)
 
-hidden = [".pythonlibs"]
+# 1. 開發環境 "Run" 按鈕的命令：直接執行 Python 主檔案
+run = "python3 app_splitbill.py" # <--- 假設您的分帳機器人主檔案是這個
 
+language = "python3"
+entrypoint = "app_splitbill.py" # 你的主程式檔案
+hidden = [".config", "**/__pycache__", "**/.mypy_cache", "**/*.pyc"]
+
+# 2. modules 和 nix channel 仿照成功範例
+modules = ["python-3.11", "postgresql-16"]
 [nix]
-channel = "stable-24_05"
+channel = "stable-22_11" # <--- 使用您成功範例中的 channel
+# packages = ["cacert"] # 如果您的待辦清單機器人有這個，可以保留
 
+# 3. [env] 區塊設定，包含固定的 PORT
+[env]
+PYTHONPATH = "$PYTHONPATH:${REPL_HOME}"
+PATH = "${REPL_HOME}/venv/bin:${PATH}" # 確保 venv/bin 在 PATH 中
+PORT = "7777" # <--- 設定一個固定的內部埠號，與 Flask app.run() 中的埠號一致
+
+[packager]
+language = "python3"
+# ignoredPackages = ["unit_tests"] # 如果您的待辦清單機器人有這個，可以保留
+
+[packager.features]
+packageSearch = true
+guessImports = true # Replit 會嘗試猜測並安裝你 import 的套件
+
+[languages.python3]
+pattern = "**/*.py"
+syntax = "python"
+
+# [languages.python3.languageServer] # 如果您的待辦清單機器人有這個，可以保留
+# start = ["pylsp"]
+
+# 4. [deployment] 區塊，使用 Gunicorn (注意檔案名 app_splitbill:app)
 [deployment]
-run =  ["gunicorn", "--bind", "0.0.0.0:5000", "main:app"]
-deploymentTarget = "cloudrun"
+deploymentTarget = "gce" # 或您選擇的部署目標
+run = ["sh", "-c", "gunicorn app_splitbill:app --bind 0.0.0.0:$PORT --workers 3"] # $PORT 是部署環境提供的
 
+# 5. [[ports]] 區塊，明確映射埠號
 [[ports]]
-localPort = 5000
-externalPort = 80
+localPort = 7777 # 與 [env] 中的 PORT 以及 Flask app.run() 中的埠號一致
+externalPort = 80 # HTTP
+# 如果需要 HTTPS，Replit 通常會自動處理或您需要額外設定
+# [[ports]]
+# localPort = 7777
+# externalPort = 443 # HTTPS

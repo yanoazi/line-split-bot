@@ -1,0 +1,8 @@
+# requirements.txt
+flask
+line-bot-sdk
+SQLAlchemy
+psycopg2-binary
+python-dotenv
+requests
+gunicorn
