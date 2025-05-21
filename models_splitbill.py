@@ -100,7 +100,10 @@ class BillParticipant(Base):
     is_paid = Column(Boolean, default=False, nullable=False)
     paid_at = Column(DateTime(timezone=True), nullable=True)
 
-    __table_args__ = (UniqueConstraint('bill_id', 'debtor_id', name='_sb_bill_debtor_uc'),) # One entry per debtor per bill
+    __table_args__ = (
+        UniqueConstraint('bill_id', 'debtor_id', name='_sb_bill_debtor_uc'),
+        {'extend_existing': True}
+    )
 
     def __repr__(self):
         return f"<BillParticipant(bill_id={self.bill_id}, debtor_id={self.debtor_id}, owed={self.amount_owed}, paid={self.is_paid})>"
@@ -113,19 +116,14 @@ def init_db_splitbill(): # Renamed
     except Exception as e:
         logger.exception(f"初始化分帳資料庫時發生錯誤: {e}")
 
-# --- CRUD HELPER FUNCTIONS (Example - to be expanded in app.py or a dedicated crud.py) ---
-
 def get_or_create_member(db: Session, name: str, group_id: str, line_user_id: Optional[str] = None) -> GroupMember:
     member = db.query(GroupMember).filter_by(name=name, group_id=group_id).first()
     if not member:
         member = GroupMember(name=name, group_id=group_id, line_user_id=line_user_id)
         db.add(member)
-        # db.commit() # Commit strategy: commit after all related objects are ready or by calling function
-        # db.refresh(member)
         logger.info(f"準備建立成員: {name} in group {group_id}")
-    elif line_user_id and not member.line_user_id: # Update line_user_id if initially missing
+    elif line_user_id and not member.line_user_id:
         member.line_user_id = line_user_id
-        # db.commit()
         logger.info(f"更新成員 {name} 的 line_user_id")
     return member
 
@@ -142,35 +140,11 @@ def get_active_bills_by_group(db: Session, group_id: str) -> List[Bill]:
     ).filter(Bill.group_id == group_id, Bill.is_archived == False)\
      .order_by(Bill.created_at.desc()).all()
 
-class BillParticipant(Base):
-    __tablename__ = "sb_bill_participants" # <--- 必須有這個
-    id = Column(Integer, primary_key=True, index=True)
-
-    bill_id = Column(Integer, ForeignKey('sb_bills.id'), nullable=False)
-    bill = relationship("Bill", back_populates="participants")
-
-    debtor_id = Column(Integer, ForeignKey('sb_group_members.id'), nullable=False)
-    debtor_member = relationship("GroupMember", back_populates="bill_participations", foreign_keys=[debtor_id])
-
-    amount_owed = Column(Numeric(10, 2), nullable=False)
-    is_paid = Column(Boolean, default=False, nullable=False)
-    paid_at = Column(DateTime(timezone=True), nullable=True)
-
-    __table_args__ = (UniqueConstraint('bill_id', 'debtor_id', name='_sb_bill_debtor_uc'),)
-
-    def __repr__(self):
-        return f"<BillParticipant(bill_id={self.bill_id}, debtor_id={self.debtor_id}, owed={self.amount_owed}, paid={self.is_paid})>"
-
 def get_unpaid_debts_for_member(db: Session, member_id: int, group_id: str) -> List[BillParticipant]:
-    """
-    Fetches all bill participations where the specified member is a debtor,
-    the bill belongs to the given group, is not paid, and the bill is not archived.
-    """
     return db.query(BillParticipant)\
         .join(BillParticipant.bill)\
         .options(
-            joinedload(BillParticipant.bill).joinedload(Bill.payer), # Load bill and its payer
-            # joinedload(BillParticipant.debtor_member) # Debtor is the member_id passed, so not strictly needed here
+            joinedload(BillParticipant.bill).joinedload(Bill.payer)
         )\
         .filter(
             BillParticipant.debtor_id == member_id,
@@ -180,3 +154,4 @@ def get_unpaid_debts_for_member(db: Session, member_id: int, group_id: str) -> L
         )\
         .order_by(Bill.created_at.asc())\
         .all()
+```
