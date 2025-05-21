@@ -154,4 +154,3 @@ def get_unpaid_debts_for_member(db: Session, member_id: int, group_id: str) -> L
         )\
         .order_by(Bill.created_at.asc())\
         .all()
-```
