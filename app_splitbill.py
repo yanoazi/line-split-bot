@@ -64,7 +64,6 @@ ADD_BILL_PATTERN = r'^#新增支出\s+([\d\.]+)\s+(.+?)\s+((?:@\S+(?:\s+[\d\.]+)
 LIST_BILLS_PATTERN = r'^#帳單列表$'
 BILL_DETAILS_PATTERN = r'^#支出詳情\s+B-(\d+)$'
 SETTLE_PAYMENT_PATTERN = r'^#結帳\s+B-(\d+)\s+((?:@\S+\s*)+)$'
-ARCHIVE_BILL_PATTERN = r'^#封存帳單\s+B-(\d+)$'
 MY_DEBTS_PATTERN = r'^#我的欠款$'
 HELP_PATTERN = r'^#幫助$'
 # 新增Flex Message相關的指令
@@ -75,6 +74,8 @@ PERSONAL_SETTLEMENT_PATTERN = r'^#個人結算$'
 GROUP_SETTLEMENT_PATTERN = r'^#群組結算$'
 # v1.0 新增：群組總欠款查看
 GROUP_DEBTS_OVERVIEW_PATTERN = r'^#群組欠款$'
+# v1.0 新增：完整帳單列表
+COMPLETE_BILLS_PATTERN = r'^#完整帳單$'
 
 def normalize_participants_string(participants_str: str) -> str:
     """標準化參與人字串用於生成一致的 content_hash - v1.0 版本"""
@@ -229,7 +230,6 @@ def handle_text_message(event: MessageEvent):
             list_bills_match = re.match(LIST_BILLS_PATTERN, text)
             bill_details_match = re.match(BILL_DETAILS_PATTERN, text)
             settle_payment_match = re.match(SETTLE_PAYMENT_PATTERN, text)
-            archive_bill_match = re.match(ARCHIVE_BILL_PATTERN, text)
             my_debts_match = re.match(MY_DEBTS_PATTERN, text)
             help_match = re.match(HELP_PATTERN, text)
             flex_create_bill_match = re.match(FLEX_CREATE_BILL_PATTERN, text)
@@ -237,6 +237,7 @@ def handle_text_message(event: MessageEvent):
             personal_settlement_match = re.match(PERSONAL_SETTLEMENT_PATTERN, text)
             group_settlement_match = re.match(GROUP_SETTLEMENT_PATTERN, text)
             group_debts_overview_match = re.match(GROUP_DEBTS_OVERVIEW_PATTERN, text)
+            complete_bills_match = re.match(COMPLETE_BILLS_PATTERN, text)
 
             if add_bill_match:
                 if not sender_mention_name:
@@ -252,9 +253,6 @@ def handle_text_message(event: MessageEvent):
                 bill_db_id = int(settle_payment_match.group(1))
                 debtor_mentions_str = settle_payment_match.group(2)
                 handle_settle_payment_v280(reply_token, bill_db_id, debtor_mentions_str, group_id, sender_line_user_id, db)
-            elif archive_bill_match:
-                bill_db_id = int(archive_bill_match.group(1))
-                handle_archive_bill_v280(reply_token, bill_db_id, group_id, sender_line_user_id, db)
             elif my_debts_match:
                 handle_my_debts_v280(reply_token, sender_line_user_id, group_id, db)
             elif help_match:
@@ -269,6 +267,8 @@ def handle_text_message(event: MessageEvent):
                 handle_group_settlement_v285(reply_token, group_id, sender_line_user_id, db)
             elif group_debts_overview_match:
                 handle_group_debts_overview_v283(reply_token, group_id, sender_line_user_id, db)
+            elif complete_bills_match:
+                handle_complete_bills_list_v1(reply_token, group_id, sender_line_user_id, db)
             else:
                 logger.info(f"分帳Bot: Unmatched command '{text}' in group {group_id}")
 
@@ -408,7 +408,7 @@ def handle_add_bill_v284(reply_token: str, match: re.Match, group_id: str, payer
         logger.error(f"新增帳單失敗 - 狀態: {status}, 群組: {group_id}, 付款人: {payer_line_user_id}")
 
 def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
-    """列出帳單功能，使用Flex Message呈現"""
+    """簡潔帳單列表功能 - 條列式顯示所有帳單名稱及付款人"""
     operation_hash = generate_operation_hash(sender_line_user_id, "list_bills", group_id)
 
     if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
@@ -482,115 +482,49 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
         line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text="帳單列表 - 無待處理帳單", contents=flex_message))
         return
 
-    # 計算總帳單數和已結清數
+    # 計算總帳單數
     total_bills = len(bills)
-    cleared_bills = sum(1 for bill in bills if bill.participants and all(p.is_paid for p in bill.participants))
     
-    # 構建帳單清單（最多顯示8筆）
+    # 構建簡潔的帳單條列（顯示所有帳單，不限制數量）
     bill_contents = []
-    for i, bill in enumerate(bills[:8]):
+    for i, bill in enumerate(bills):
         if i > 0:
-            bill_contents.append({"type": "separator", "margin": "md"})
+            bill_contents.append({"type": "separator", "margin": "sm"})
         
-        # 計算此帳單的付款狀況
-        paid_count = sum(1 for p in bill.participants if p.is_paid)
-        total_participants = len(bill.participants)
+        # 簡潔的單行顯示：B-ID: 帳單名稱 | 付款人
+        bill_title = bill.description[:20] + ("..." if len(bill.description) > 20 else "")
         
-        # 狀態顏色和圖示
-        if total_participants == 0:
-            status_color = "#999999"
-            status_icon = "⚪"
-            status_text = "無參與人"
-        elif paid_count == total_participants:
-            status_color = "#4CAF50"
-            status_icon = "✅"
-            status_text = "已結清"
-        elif paid_count > 0:
-            status_color = "#FF9800"
-            status_icon = "🔄"
-            status_text = f"{paid_count}/{total_participants}"
-        else:
-            status_color = "#F44336"
-            status_icon = "⭕"
-            status_text = "未付款"
-        
-        bill_contents.extend([
-            {
-                "type": "box",
-                "layout": "horizontal",
-                "contents": [
-                    {
-                        "type": "text",
-                        "text": f"B-{bill.id}",
-                        "size": "sm",
-                        "color": "#2196F3",
-                        "weight": "bold",
-                        "flex": 1
-                    },
-                    {
-                        "type": "text",
-                        "text": f"{status_icon} {status_text}",
-                        "size": "sm",
-                        "color": status_color,
-                        "weight": "bold",
-                        "align": "end",
-                        "flex": 1
-                    }
-                ],
-                "margin": "sm"
-            },
-            {
-                "type": "text",
-                "text": bill.description[:25] + ("..." if len(bill.description) > 25 else ""),
-                "size": "md",
-                "color": "#333333",
-                "weight": "bold",
-                "margin": "xs"
-            },
-            {
-                "type": "box",
-                "layout": "horizontal",
-                "contents": [
-                    {
-                        "type": "text",
-                        "text": f"付款人: @{bill.payer_member_profile.name}",
-                        "size": "xs",
-                        "color": "#666666",
-                        "flex": 1
-                    },
-                    {
-                        "type": "text",
-                        "text": f"${int(bill.total_bill_amount)}",
-                        "size": "sm",
-                        "color": "#FF9800",
-                        "weight": "bold",
-                        "align": "end",
-                        "flex": 1
-                    }
-                ],
-                "margin": "xs"
-            },
-            {
-                "type": "text",
-                "text": f"{'均攤' if bill.split_type == SplitType.EQUAL else '分別計算'} | {bill.created_at.strftime('%m/%d %H:%M') if bill.created_at else 'N/A'}",
-                "size": "xs",
-                "color": "#999999",
-                "margin": "xs"
-            }
-        ])
-    
-    if len(bills) > 8:
-        bill_contents.extend([
-            {"type": "separator", "margin": "md"},
-            {
-                "type": "text",
-                "text": f"... 還有 {len(bills) - 8} 筆帳單",
-                "size": "xs",
-                "color": "#999999",
-                "align": "center",
-                "margin": "sm"
-            }
-        ])
+        bill_contents.append({
+            "type": "box",
+            "layout": "horizontal",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"B-{bill.id}:",
+                    "size": "sm",
+                    "color": "#2196F3",
+                    "weight": "bold",
+                    "flex": 0
+                },
+                {
+                    "type": "text",
+                    "text": bill_title,
+                    "size": "sm",
+                    "color": "#333333",
+                    "flex": 3,
+                    "margin": "sm"
+                },
+                {
+                    "type": "text",
+                    "text": f"@{bill.payer_member_profile.name}",
+                    "size": "xs",
+                    "color": "#666666",
+                    "align": "end",
+                    "flex": 2
+                }
+            ],
+            "margin": "xs"
+        })
 
     flex_message = {
         "type": "bubble",
@@ -606,26 +540,10 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
                     "color": "#2196F3"
                 },
                 {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": f"共 {total_bills} 筆帳單",
-                            "size": "sm",
-                            "color": "#666666",
-                            "flex": 1
-                        },
-                        {
-                            "type": "text",
-                            "text": f"已結清 {cleared_bills} 筆",
-                            "size": "sm",
-                            "color": "#4CAF50",
-                            "weight": "bold",
-                            "align": "end",
-                            "flex": 1
-                        }
-                    ],
+                    "type": "text",
+                    "text": f"共 {total_bills} 筆帳單",
+                    "size": "sm",
+                    "color": "#666666",
                     "margin": "sm"
                 }
             ],
@@ -638,7 +556,7 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
             "contents": [
                 {
                     "type": "text",
-                    "text": "帳單明細 (按建立時間排序)",
+                    "text": "條列總覽 (按建立時間排序)",
                     "size": "md",
                     "weight": "bold",
                     "margin": "md"
@@ -647,6 +565,9 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
                     "type": "box",
                     "layout": "vertical",
                     "contents": bill_contents,
+                    "backgroundColor": "#FAFAFA",
+                    "paddingAll": "15px",
+                    "cornerRadius": "8px",
                     "margin": "md"
                 }
             ],
@@ -663,8 +584,8 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
                     "height": "sm",
                     "action": {
                         "type": "message",
-                        "label": "💸 我的欠款",
-                        "text": "#我的欠款"
+                        "label": "📄 完整明細",
+                        "text": "#完整帳單"
                     },
                     "flex": 1
                 },
@@ -674,8 +595,8 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
                     "height": "sm",
                     "action": {
                         "type": "message",
-                        "label": "👥 群組欠款",
-                        "text": "#群組欠款"
+                        "label": "💰 我的欠款",
+                        "text": "#我的欠款"
                     },
                     "flex": 1
                 }
@@ -687,7 +608,7 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
     line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text=f"帳單列表 - 共 {total_bills} 筆", contents=flex_message))
 
 def handle_bill_details_v280(reply_token: str, bill_db_id: int, group_id: str, sender_line_user_id: str, db: Session):
-    """帳單詳情功能，確保群組隔離"""
+    """帳單詳情功能 v1.0 - 簡化顯示，移除已付款狀態"""
     operation_hash = generate_operation_hash(sender_line_user_id, "bill_details", f"{group_id}:{bill_db_id}")
 
     if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
@@ -700,32 +621,34 @@ def handle_bill_details_v280(reply_token: str, bill_db_id: int, group_id: str, s
         line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到帳單 B-{bill_db_id}。"))
         return
         
-    paid_count = sum(1 for p in bill.participants if p.is_paid)
     total_participants = len(bill.participants)
+    total_owed = sum(p.amount_owed for p in bill.participants)
+    
     reply_msg = (
         f"--- 💳 支出詳情: B-{bill.id} ---\n"
-        f"名目: {bill.description}\n付款人: @{bill.payer_member_profile.name}\n總額: {bill.total_bill_amount:.2f}\n"
+        f"名目: {bill.description}\n"
+        f"付款人: @{bill.payer_member_profile.name}\n"
+        f"總額: ${int(bill.total_bill_amount)}\n"
         f"類型: {'均攤' if bill.split_type == SplitType.EQUAL else '分別計算'}\n"
         f"建立於: {bill.created_at.strftime('%y/%m/%d %H:%M') if bill.created_at else 'N/A'}\n"
-        f"狀態: {'已封存' if bill.is_archived else '處理中'}\n"
-        f"進度: {paid_count}/{total_participants} 人已付\n參與人:"
     )
-    if not bill.participants: reply_msg += "\n  (無參與人)"
-    else:
+    
+    if bill.participants:
+        reply_msg += f"參與人 ({total_participants}人，共欠${int(total_owed)}):"
         for p in bill.participants:
-            reply_msg += f"\n  {'✅' if p.is_paid else '🅾️'} @{p.debtor_member_profile.name} 應付 {p.amount_owed:.2f} " + (f"({p.paid_at.strftime('%y/%m/%d')})" if p.is_paid and p.paid_at else "")
-    if not bill.is_archived:
-        reply_msg += f"\n\n➡️ 付款人可 `#結帳 B-{bill.id} @已付成員` 更新。"
-        if bill.participants and paid_count == total_participants:
-            reply_msg += f"\n➡️ 已結清！付款人可 `#封存帳單 B-{bill.id}`。"
+            reply_msg += f"\n  💰 @{p.debtor_member_profile.name}: ${int(p.amount_owed)}"
+        reply_msg += f"\n\n💡 使用 `#結帳 B-{bill.id} @成員名` 進行結算"
+    else:
+        reply_msg += "參與人: (無參與人)"
+    
     line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_msg[:4950] + ("..." if len(reply_msg)>4950 else "")))
 
 def handle_settle_payment_v280(reply_token: str, bill_db_id: int, debtor_mentions_str: str, group_id: str, sender_line_user_id: str, db: Session):
-    """結帳功能，加入重複操作防護和權限驗證"""
+    """結帳功能 v1.0 - 付款=結算=刪除帳單"""
     operation_content = f"settle:{bill_db_id}:{debtor_mentions_str}"
     operation_hash = generate_operation_hash(sender_line_user_id, "settle_payment", operation_content)
 
-    if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
+    if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=2):
         line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 偵測到重複結帳操作，請稍等片刻再試。"))
         return
 
@@ -740,74 +663,82 @@ def handle_settle_payment_v280(reply_token: str, bill_db_id: int, debtor_mention
     if not bill.payer_member_profile.line_user_id or bill.payer_member_profile.line_user_id != sender_line_user_id:
         line_bot_api.reply_message(reply_token, TextSendMessage(text=f"只有此帳單的付款人 @{bill.payer_member_profile.name} 才能執行結帳。"))
         return
-        
-    if bill.is_archived: 
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"帳單 B-{bill_db_id} 已封存。"))
-        return
 
     debtor_names_to_settle = {name.strip() for name in re.findall(r'@(\S+)', debtor_mentions_str) if name.strip()}
     if not debtor_names_to_settle: 
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="請 @提及 至少一位要標記付款的參與人。"))
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="請 @提及 要結算的參與人。"))
         return
 
-    settled_count, already_paid_names, not_found_names = 0, [], list(debtor_names_to_settle)
+    # 查找要結算的參與人
+    settled_participants = []
+    not_found_names = []
+    settled_amount = Decimal(0)
+    
     for bp in bill.participants:
         if bp.debtor_member_profile.name in debtor_names_to_settle:
-            if bp.debtor_member_profile.name in not_found_names: 
-                not_found_names.remove(bp.debtor_member_profile.name)
-            if not bp.is_paid: 
-                bp.is_paid = True
-                bp.paid_at = datetime.now(timezone.utc)
-                bp.updated_at = datetime.now(timezone.utc)
-                settled_count += 1
-            else: 
-                already_paid_names.append(f"@{bp.debtor_member_profile.name}")
+            settled_participants.append(bp)
+            settled_amount += bp.amount_owed
+        else:
+            # 檢查是否有人提及了不存在的參與人
+            pass
+    
+    # 檢查是否有提及不存在的參與人
+    found_names = {bp.debtor_member_profile.name for bp in settled_participants}
+    not_found_names = list(debtor_names_to_settle - found_names)
 
-    if settled_count > 0: 
-        bill.updated_at = datetime.now(timezone.utc)
-        db.commit()
-        logger.info(f"成功結帳 {settled_count} 人 - 帳單: B-{bill_db_id}, 群組: {group_id}")
-
-    reply_parts = []
-    if settled_count > 0: reply_parts.append(f"✅ 已為 B-{bill_db_id} 標記 {settled_count} 人付款。")
-    if already_paid_names: reply_parts.append(f"提示: {', '.join(already_paid_names)} 先前已付。")
-    if not_found_names: reply_parts.append(f"注意: 於此帳單找不到參與人: {', '.join(['@'+n for n in not_found_names])}。")
-    line_bot_api.reply_message(reply_token, TextSendMessage(text="\n".join(reply_parts) if reply_parts else "無效操作或未提及有效參與人。"))
-
-def handle_archive_bill_v280(reply_token: str, bill_db_id: int, group_id: str, sender_line_user_id: str, db: Session):
-    """封存帳單功能，加入重複操作防護和權限驗證"""
-    operation_hash = generate_operation_hash(sender_line_user_id, "archive_bill", f"{group_id}:{bill_db_id}")
-
-    if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 偵測到重複封存操作，請稍等片刻再試。"))
+    if not settled_participants and not_found_names:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"在此帳單中找不到參與人: {', '.join(['@'+n for n in not_found_names])}。"))
+        return
+    
+    if not settled_participants:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="沒有找到要結算的有效參與人。"))
         return
 
-    log_operation(db, operation_hash, group_id, sender_line_user_id, "archive_bill")
-
-    bill = get_bill_by_id(db, bill_db_id, group_id)
-    if not bill: 
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"找不到帳單 B-{bill_db_id}。"))
-        return
-
-    # 驗證操作權限：只有付款人才能執行封存
-    if not bill.payer_member_profile.line_user_id or bill.payer_member_profile.line_user_id != sender_line_user_id:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"只有此帳單的付款人 @{bill.payer_member_profile.name} 才能執行封存。"))
-        return
-        
-    if bill.is_archived: 
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"帳單 B-{bill_db_id} 已封存。"))
-        return
-
-    bill.is_archived = True
-    bill.updated_at = datetime.now(timezone.utc)
     try:
-        db.commit()
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"✅ 帳單 B-{bill_db_id} ({bill.description[:20]}...) 已封存。"))
-        logger.info(f"成功封存帳單 B-{bill_db_id} - 群組: {group_id}, 操作者: {sender_line_user_id}")
-    except Exception as e: 
+        # 刪除已結算的參與人記錄
+        for bp in settled_participants:
+            db.delete(bp)
+        
+        # 檢查是否還有其他參與人未結算
+        remaining_participants = [bp for bp in bill.participants if bp not in settled_participants]
+        
+        if not remaining_participants:
+            # 所有人都結算了，刪除整個帳單
+            db.delete(bill)
+            db.commit()
+            
+            reply_msg = (
+                f"✅ 帳單 B-{bill_db_id} 結算完成！\n"
+                f"名目: {bill.description}\n"
+                f"結算金額: ${int(settled_amount)}\n"
+                f"已結算: {', '.join([f'@{bp.debtor_member_profile.name}' for bp in settled_participants])}\n"
+                f"🗑️ 帳單已完全結算並刪除。"
+            )
+        else:
+            # 還有其他人未結算，只刪除已結算的參與人
+            db.commit()
+            
+            remaining_amount = sum(bp.amount_owed for bp in remaining_participants)
+            reply_msg = (
+                f"✅ 部分結算完成！\n"
+                f"帳單: B-{bill_db_id} ({bill.description})\n"
+                f"已結算: {', '.join([f'@{bp.debtor_member_profile.name}' for bp in settled_participants])} (${int(settled_amount)})\n"
+                f"剩餘未結算: {len(remaining_participants)}人 (${int(remaining_amount)})\n"
+                f"💡 全部結算完成後帳單將自動刪除。"
+            )
+
+        if not_found_names:
+            reply_msg += f"\n⚠️ 注意: 找不到參與人 {', '.join(['@'+n for n in not_found_names])}。"
+
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_msg))
+        logger.info(f"成功結算 B-{bill_db_id} - 結算人數: {len(settled_participants)}, 剩餘人數: {len(remaining_participants)}")
+
+    except Exception as e:
         db.rollback()
-        logger.error(f"封存帳單 B-{bill_db_id} 失敗: {e}")
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="封存失敗。"))
+        logger.exception(f"結帳時發生錯誤 - 帳單: B-{bill_db_id}, 群組: {group_id}: {e}")
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="結帳過程中發生錯誤，請稍後再試。"))
+
+
 
 def handle_my_debts_v280(reply_token: str, sender_line_user_id: str, group_id: str, db: Session):
     """我的欠款功能，使用Flex Message呈現"""
@@ -1320,7 +1251,7 @@ def handle_group_settlement_v285(reply_token: str, group_id: str, sender_line_us
         line_bot_api.reply_message(reply_token, TextSendMessage(text="結算過程中發生錯誤，請稍後再試。"))
 
 def send_splitbill_help_v284(reply_token: str):
-    """v1.0 更新的幫助訊息，包含新的結算刪除功能"""
+    """v1.0 更新的幫助訊息 - 簡化功能，付款即結算刪除"""
     help_text = (
         "--- 💸 分帳機器人指令 (v1.0) --- \n\n"
         "🔸 新增支出 (您自動參與分攤):\n"
@@ -1339,8 +1270,9 @@ def send_splitbill_help_v284(reply_token: str):
         "• 不需要@自己（LINE不支援）\n"
         "• 金額分攤採無條件進位至整數\n\n"
         "🔸 視覺化選單:\n  #選單 - 主選單\n  #建立帳單 - 帳單建立精靈\n"
-        "🔸 查看功能:\n  #帳單列表 - 查看所有帳單\n  #支出詳情 B-ID - 查看特定帳單\n  #我的欠款 - 查看個人未付款項\n  #群組欠款 - 查看群組所有成員欠款\n"
-        "🔸 結算功能:\n  #結帳 B-ID @已付成員1 @成員2... - 標記個別付款\n  #個人結算 - 刪除個人所有付款帳單\n  #群組結算 - 刪除群組所有帳單\n  #封存帳單 B-ID - 手動封存帳單\n\n"
+        "🔸 查看功能:\n  #帳單列表 - 查看帳單概要(最多8筆)\n  #完整帳單 - 查看所有帳單完整詳情\n  #支出詳情 B-ID - 查看特定帳單\n  #我的欠款 - 查看個人未付款項\n  #群組欠款 - 查看群組所有成員欠款\n"
+        "🔸 結算功能:\n  #結帳 B-ID @成員1 @成員2... - 付款結算並刪除\n  #個人結算 - 刪除個人所有付款帳單\n  #群組結算 - 刪除群組所有帳單\n\n"
+        "⚠️ 重要：付款 = 結算 = 刪除帳單\n所有結算操作會永久刪除記錄，無法復原\n\n"
         "🔸 本說明:\n  #幫助"
     )
     line_bot_api.reply_message(reply_token, TextSendMessage(text=help_text))
@@ -1404,14 +1336,33 @@ def send_flex_main_menu_v285(reply_token: str):
                     "color": "#4CAF50"
                 },
                 {
-                    "type": "button",
-                    "style": "secondary",
-                    "height": "sm",
-                    "action": {
-                        "type": "message",
-                        "label": "📋 查看帳單列表",
-                        "text": "#帳單列表"
-                    }
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        {
+                            "type": "button",
+                            "style": "secondary",
+                            "height": "sm",
+                            "action": {
+                                "type": "message",
+                                "label": "📋 帳單列表",
+                                "text": "#帳單列表"
+                            },
+                            "flex": 1
+                        },
+                        {
+                            "type": "button",
+                            "style": "secondary",
+                            "height": "sm",
+                            "action": {
+                                "type": "message",
+                                "label": "📄 完整帳單",
+                                "text": "#完整帳單"
+                            },
+                            "flex": 1
+                        }
+                    ]
                 },
                 {
                     "type": "box",
@@ -1950,6 +1901,103 @@ def handle_group_debts_overview_v283(reply_token: str, group_id: str, sender_lin
     }
     
     line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text=f"群組欠款總覽 - ${int(total_group_debt)}", contents=flex_message))
+
+def handle_complete_bills_list_v1(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
+    """完整帳單列表功能 - 顯示所有帳單及完整欠款詳情（無限制）"""
+    operation_hash = generate_operation_hash(sender_line_user_id, "complete_bills_list", group_id)
+
+    if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
+        return  # 靜默忽略重複的完整帳單查詢
+
+    log_operation(db, operation_hash, group_id, sender_line_user_id, "complete_bills_list")
+
+    # 獲取群組中所有帳單（包括已封存的，因為我們要顯示完整信息）
+    all_bills = db.query(Bill).options(
+        joinedload(Bill.payer_member_profile),
+        joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
+    ).filter(
+        Bill.group_id == group_id
+    ).order_by(Bill.created_at.desc()).all()
+
+    if not all_bills:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="🎉 群組乾淨！目前沒有任何帳單記錄。"))
+        return
+
+    # 構建完整的帳單報告
+    report_lines = [
+        f"📋 完整帳單列表 (共 {len(all_bills)} 筆)",
+        f"=" * 30
+    ]
+
+    for i, bill in enumerate(all_bills, 1):
+        # 計算欠款狀況
+        total_participants = len(bill.participants)
+        total_owed = sum(p.amount_owed for p in bill.participants)
+        
+        # 狀態標記（簡化版）
+        if total_participants == 0:
+            status_text = "⚪ 無參與人"
+        else:
+            status_text = f"💰 {total_participants}人欠款"
+        
+        # 帳單基本信息
+        report_lines.extend([
+            f"",
+            f"【{i}】B-{bill.id}: {bill.description}",
+            f"付款人: @{bill.payer_member_profile.name}",
+            f"總額: ${int(bill.total_bill_amount)} ({status_text})",
+            f"類型: {'均攤' if bill.split_type == SplitType.EQUAL else '分別計算'}",
+            f"時間: {bill.created_at.strftime('%y/%m/%d %H:%M') if bill.created_at else 'N/A'}"
+        ])
+        
+        # 欠款人詳情
+        if bill.participants:
+            report_lines.append(f"欠款明細 (共${int(total_owed)}):")
+            for participant in bill.participants:
+                report_lines.append(f"  💰 @{participant.debtor_member_profile.name}: ${int(participant.amount_owed)}")
+        else:
+            report_lines.append("  (無欠款人)")
+
+    # 分割長訊息以符合LINE限制
+    full_report = "\n".join(report_lines)
+    
+    # LINE訊息長度限制約5000字元，我們保守使用4500
+    max_length = 4500
+    if len(full_report) <= max_length:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=full_report))
+    else:
+        # 分割訊息
+        parts = []
+        current_part = ""
+        
+        for line in report_lines:
+            if len(current_part + line + "\n") > max_length:
+                if current_part:
+                    parts.append(current_part.strip())
+                    current_part = line + "\n"
+                else:
+                    # 單行過長，強制截斷
+                    parts.append(line[:max_length-10] + "...")
+            else:
+                current_part += line + "\n"
+        
+        if current_part:
+            parts.append(current_part.strip())
+        
+        # 發送第一部分並提示
+        first_part = parts[0] + f"\n\n📄 訊息過長，已分割 ({len(parts)} 部分)"
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=first_part))
+        
+        # 發送其餘部分（延遲發送避免過於頻繁）
+        import time
+        for i, part in enumerate(parts[1:], 2):
+            time.sleep(0.5)  # 避免訊息發送過快
+            header = f"📄 第 {i} 部分 / 共 {len(parts)} 部分\n" + "=" * 20 + "\n"
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=header + part))
+            except Exception as e:
+                logger.warning(f"發送完整帳單列表第{i}部分失敗: {e}")
+                break
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 7777)) 
