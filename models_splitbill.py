@@ -1,4 +1,4 @@
-# models_splitbill.py (v2.8.0 - Fixed Group Isolation & Duplicate Prevention)
+# models_splitbill.py (v1.0 - Fixed Group Isolation & Duplicate Prevention)
 import os
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, DateTime, ForeignKey,
@@ -184,7 +184,7 @@ def log_operation(db: Session, operation_hash: str, group_id: str, user_id: str,
     db.flush()
 
 def init_db_splitbill():
-    logger.info("初始化分帳資料庫 (v2.8.0 - Fixed Group Isolation & Duplicate Prevention)，嘗試建立表格...")
+    logger.info("初始化分帳資料庫 (v1.0 - Fixed Group Isolation & Duplicate Prevention)，嘗試建立表格...")
     try:
         Base.metadata.create_all(bind=engine)
         logger.info("分帳表格建立完成 (如果原本不存在的話)。")
@@ -194,7 +194,7 @@ def init_db_splitbill():
 def get_or_create_member_by_line_id(db: Session, line_user_id: str, group_id: str, display_name: str) -> GroupMember:
     """
     根據LINE User ID在特定群組中獲取或創建成員
-    v2.8.4 強化：修復併發競爭條件問題
+    v1.0 強化：修復併發競爭條件問題
     """
     # 使用重試機制處理競爭條件
     max_retries = 3
@@ -258,7 +258,7 @@ def get_or_create_member_by_line_id(db: Session, line_user_id: str, group_id: st
 def get_or_create_member_by_name(db: Session, name: str, group_id: str) -> GroupMember:
     """
     根據名稱在特定群組中獲取或創建成員
-    v2.8.4 強化：添加重試機制處理競爭條件
+    v1.0 強化：添加重試機制處理競爭條件
     """
     max_retries = 3
     for attempt in range(max_retries):
@@ -358,7 +358,7 @@ def cleanup_old_duplicate_logs(db: Session, days_to_keep: int = 7):
 
 def generate_content_hash_v284(payer_id: int, description: str, amount: str, participants_str: str, group_id: str) -> str:
     """
-    v2.8.4 強化版內容hash生成：
+    v1.0 強化版內容hash生成：
     - 包含群組ID確保群組隔離
     - 標準化描述（去除多餘空白、統一大小寫）
     - 標準化金額格式
@@ -395,7 +395,7 @@ def generate_content_hash_v284(payer_id: int, description: str, amount: str, par
 
 def atomic_create_bill_v284(db: Session, bill_data: dict, participants_data: List[dict]) -> tuple:
     """
-    原子性創建帳單 v2.8.4 強化版：
+    原子性創建帳單 v1.0 強化版：
     - 使用資料庫事務確保一致性
     - 處理重複約束違反
     - 添加重試機制處理併發情況
