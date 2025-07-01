@@ -1,4 +1,4 @@
-# app_splitbill.py (v2.8.0 - Fixed Group Isolation & Duplicate Prevention)
+# app_splitbill.py (v2.8.2 - Pure Group Bill Splitting & Complete Settlement)
 from flask import Flask, request, abort, jsonify
 import os
 import re
@@ -27,7 +27,8 @@ from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from linebot import LineBotApi, WebhookHandler 
 from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage
+    MessageEvent, TextMessage, TextSendMessage, FlexSendMessage,
+    QuickReply, QuickReplyButton, MessageAction, PostbackAction
 )
 
 app = Flask(__name__)
@@ -46,14 +47,14 @@ if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
 try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    logger.info("LINE Bot API 初始化成功 (v2.8.0)。")
+    logger.info("LINE Bot API 初始化成功 (v2.8.2)。")
 except Exception as e:
     logger.exception(f"初始化 LINE SDK 失敗: {e}")
     exit(1)
 
 try:
     init_db()
-    logger.info("分帳資料庫初始化檢查完成 (v2.8.0)。")
+    logger.info("分帳資料庫初始化檢查完成 (v2.8.2)。")
 except Exception as e:
     logger.exception(f"分帳資料庫初始化失敗: {e}")
 
@@ -65,64 +66,94 @@ SETTLE_PAYMENT_PATTERN = r'^#結帳\s+B-(\d+)\s+((?:@\S+\s*)+)$'
 ARCHIVE_BILL_PATTERN = r'^#封存帳單\s+B-(\d+)$'
 MY_DEBTS_PATTERN = r'^#我的欠款$'
 HELP_PATTERN = r'^#幫助$'
+# 新增Flex Message相關的指令
+FLEX_CREATE_BILL_PATTERN = r'^#建立帳單$'
+FLEX_MENU_PATTERN = r'^#選單$'
+# 新增全面結算相關指令
+COMPLETE_SETTLEMENT_PATTERN = r'^#全面結算$'
 
-def parse_participant_input_v271(participants_str: str, total_bill_amount_from_command: Decimal, payer_mention_name: str) \
-        -> Tuple[Optional[List[Tuple[str, Decimal]]], Optional[SplitType], Optional[str]]:
+def parse_participant_input_v282(participants_str: str, total_bill_amount_from_command: Decimal, payer_mention_name: str) \
+        -> Tuple[Optional[List[Tuple[str, Decimal]]], Optional[SplitType], Optional[str], Decimal]:
+    """
+    v2.8.2 群組分帳計算邏輯：
+    - 專注於群組成員間的債務計算
+    - 付款人預設參與分攤但不會欠自己錢
+    - 移除@自己的處理邏輯（LINE不支援）
+    - 純粹的分帳計算工具
+    """
     participants_to_charge: List[Tuple[str, Decimal]] = []
     error_msg = None
     split_type = None
+    payer_share = Decimal(0)  # 付款人應分攤的金額
 
+    # 解析@提及的參與人
     raw_mentions = re.findall(r'@(\S+)(?:\s+([\d\.]+))?', participants_str)
 
     if not raw_mentions:
-        return None, None, "請至少 @提及一位參與的成員。"
+        return None, None, "請至少 @提及一位參與的成員。", Decimal(0)
 
     has_any_amount_specified = any(amount_str for _, amount_str in raw_mentions)
     temp_name_set = set()
+    other_participants = []  # 其他參與人（不包括付款人）
+
+    # 收集參與人資訊，自動排除付款人
+    for name, amount_str in raw_mentions:
+        name = name.strip()
+        if name in temp_name_set: 
+            return None, None, f"參與人 @{name} 被重複提及。", Decimal(0)
+        temp_name_set.add(name)
+        
+        # 自動排除付款人（避免自己欠自己錢）
+        if name == payer_mention_name:
+            logger.info(f"自動排除付款人自己({name})，避免自己欠自己錢")
+            continue
+            
+        other_participants.append((name, amount_str))
+
+    if not other_participants:
+        return None, None, "請 @提及其他需要分攤的成員（付款人會自動參與分攤計算）。", Decimal(0)
 
     if has_any_amount_specified:
+        # 分別計算模式：檢查是否有人指定了金額
         split_type = SplitType.UNEQUAL
-        current_sum_specified_by_all_mentions = Decimal(0)
-
-        for name, amount_str in raw_mentions:
-            name = name.strip()
-            if name in temp_name_set: return None, None, f"參與人 @{name} 被重複提及。"
-            temp_name_set.add(name)
-
+        others_total = Decimal(0)
+        
+        # 計算其他參與人的指定金額
+        for name, amount_str in other_participants:
             if not amount_str:
-                return None, None, f"分別計算模式下，@{name} 未指定金額。所有提及的參與人都需要指定金額。"
+                return None, None, f"分別計算模式下，@{name} 未指定金額。請為所有參與人指定金額，或使用均攤模式。", Decimal(0)
             try:
                 amount = Decimal(amount_str)
-                if amount <= 0: return None, None, f"@{name} 的金額 ({amount_str}) 必須大於0。"
-                current_sum_specified_by_all_mentions += amount
-                if name != payer_mention_name:
-                    participants_to_charge.append((name, amount))
+                if amount <= 0: 
+                    return None, None, f"@{name} 的金額 ({amount_str}) 必須大於0。", Decimal(0)
+                others_total += amount
+                participants_to_charge.append((name, amount))
             except InvalidOperation:
-                return None, None, f"@{name} 的金額 ({amount_str}) 格式無效。"
-
-        if current_sum_specified_by_all_mentions != total_bill_amount_from_command:
-            return None, None, f"所有指定金額總和 ({current_sum_specified_by_all_mentions}) 與帳單總金額 ({total_bill_amount_from_command}) 不符。"
+                return None, None, f"@{name} 的金額 ({amount_str}) 格式無效。", Decimal(0)
+        
+        # 付款人負擔剩餘金額
+        payer_share = total_bill_amount_from_command - others_total
+        if payer_share <= 0:
+            return None, None, f"其他人的指定金額總和 ({others_total}) 已超過總金額 ({total_bill_amount_from_command})，付款人無法負擔剩餘金額。", Decimal(0)
+            
     else:
+        # 均攤模式：付款人 + 其他參與人平均分攤
         split_type = SplitType.EQUAL
-        debtors_for_equal_split_names = []
-        for name, _ in raw_mentions:
-            name = name.strip()
-            if name in temp_name_set: return None, None, f"參與人 @{name} 被重複提及。"
-            temp_name_set.add(name)
-            if name != payer_mention_name:
-                debtors_for_equal_split_names.append(name)
+        total_participants = len(other_participants) + 1  # +1 包括付款人
+        
+        # 計算每人應負擔的金額
+        individual_share_raw = total_bill_amount_from_command / Decimal(total_participants)
+        individual_share = individual_share_raw.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
+        
+        # 處理尾數問題：讓付款人承擔尾數差額
+        others_total = individual_share * Decimal(len(other_participants))
+        payer_share = total_bill_amount_from_command - others_total
+        
+        # 為其他參與人分配金額
+        for name, _ in other_participants:
+            participants_to_charge.append((name, individual_share))
 
-        num_debtors = len(debtors_for_equal_split_names)
-        if num_debtors > 0:
-            individual_share_raw = total_bill_amount_from_command / Decimal(num_debtors)
-            individual_share = individual_share_raw.quantize(Decimal('0.01'), rounding='ROUND_HALF_UP')
-            current_total_calculated = Decimal(0)
-            for i, name in enumerate(debtors_for_equal_split_names):
-                share_to_assign = individual_share if i < num_debtors - 1 else total_bill_amount_from_command - current_total_calculated
-                participants_to_charge.append((name, share_to_assign))
-                current_total_calculated += share_to_assign
-
-    return participants_to_charge, split_type, error_msg
+    return participants_to_charge, split_type, error_msg, payer_share
 
 @app.route("/splitbill/callback", methods=['POST'])
 def callback():
@@ -156,12 +187,13 @@ def handle_text_message(event: MessageEvent):
 
     logger.info(f"分帳Bot Received from G/R ID {group_id} by UserLINEID {sender_line_user_id}: '{text}'")
 
+    # 獲取發送者在群組中的顯示名稱
     sender_mention_name = ""
     try:
         profile = line_bot_api.get_group_member_profile(group_id, sender_line_user_id)
         sender_mention_name = profile.display_name
     except LineBotApiError as e_profile:
-        logger.warning(f"無法即時獲取發送者 (LINEID:{sender_line_user_id}) 在群組 {group_id} 的 Profile: {e_profile.status_code} {e_profile.error.message if e_profile.error else ''}")
+        logger.warning(f"無法獲取發送者 (LINEID:{sender_line_user_id}) 在群組 {group_id} 的 Profile: {e_profile.status_code}")
 
     try:
         with get_db() as db:
@@ -177,10 +209,13 @@ def handle_text_message(event: MessageEvent):
             archive_bill_match = re.match(ARCHIVE_BILL_PATTERN, text)
             my_debts_match = re.match(MY_DEBTS_PATTERN, text)
             help_match = re.match(HELP_PATTERN, text)
+            flex_create_bill_match = re.match(FLEX_CREATE_BILL_PATTERN, text)
+            flex_menu_match = re.match(FLEX_MENU_PATTERN, text)
+            complete_settlement_match = re.match(COMPLETE_SETTLEMENT_PATTERN, text)
 
             if add_bill_match:
                 if not sender_mention_name:
-                    line_bot_api.reply_message(reply_token, TextSendMessage(text="無法獲取您的群組名稱以設定為付款人。"))
+                    line_bot_api.reply_message(reply_token, TextSendMessage(text="無法獲取您的群組名稱，請稍後再試。"))
                     return
                 handle_add_bill_v280(reply_token, add_bill_match, group_id, sender_line_user_id, sender_mention_name, db)
             elif list_bills_match:
@@ -198,7 +233,13 @@ def handle_text_message(event: MessageEvent):
             elif my_debts_match:
                 handle_my_debts_v280(reply_token, sender_line_user_id, group_id, db)
             elif help_match:
-                send_splitbill_help_v280(reply_token)
+                send_splitbill_help_v282(reply_token)
+            elif flex_create_bill_match:
+                send_flex_create_bill_menu_v280(reply_token)
+            elif flex_menu_match:
+                send_flex_main_menu_v280(reply_token)
+            elif complete_settlement_match:
+                handle_complete_settlement_v282(reply_token, group_id, sender_line_user_id, db)
             else:
                 logger.info(f"分帳Bot: Unmatched command '{text}' in group {group_id}")
 
@@ -248,8 +289,8 @@ def handle_add_bill_v280(reply_token: str, match: re.Match, group_id: str, payer
     # 確保付款人存在於該群組中
     payer_member_obj = get_or_create_member_by_line_id(db, line_user_id=payer_line_user_id, group_id=group_id, display_name=payer_mention_name)
 
-    participants_to_charge_data, split_type, error_msg = \
-        parse_participant_input_v271(participants_input_str, total_bill_amount, payer_mention_name)
+    participants_to_charge_data, split_type, error_msg, payer_share = \
+        parse_participant_input_v282(participants_input_str, total_bill_amount, payer_mention_name)
 
     if error_msg:
         line_bot_api.reply_message(reply_token, TextSendMessage(text=f"參與人解析錯誤: {error_msg}")); return
@@ -296,12 +337,22 @@ def handle_add_bill_v280(reply_token: str, match: re.Match, group_id: str, payer
         if not persisted_bill: raise Exception("帳單提交後未能檢索")
 
         participant_details_msg = [f"@{p_bp.debtor_member_profile.name} 應付 {p_bp.amount_owed:.2f}" for p_bp in persisted_bill.participants]
+        
+        # 計算其他人應付的總額
+        others_total = sum(bp.amount_owed for bp in persisted_bill.participants)
+        
         reply_msg = (
             f"✅ 新增支出 B-{persisted_bill.id}！\n名目: {persisted_bill.description}\n"
             f"付款人: @{persisted_bill.payer_member_profile.name} (您)\n"
             f"總支出: {persisted_bill.total_bill_amount:.2f}\n"
             f"類型: {'均攤' if persisted_bill.split_type == SplitType.EQUAL else '分別計算'}\n"
         )
+        
+        if payer_share and payer_share > 0:
+            reply_msg += f"您的分攤: {payer_share:.2f}\n"
+            reply_msg += f"您實付: {persisted_bill.total_bill_amount:.2f}\n"
+            reply_msg += f"應收回: {others_total:.2f}\n"
+        
         if participant_details_msg:
             reply_msg += f"明細 ({len(participant_details_msg)}人欠款):\n" + "\n".join(participant_details_msg)
         else:
@@ -312,10 +363,10 @@ def handle_add_bill_v280(reply_token: str, match: re.Match, group_id: str, payer
         logger.info(f"成功新增帳單 B-{persisted_bill.id} - 群組: {group_id}, 付款人: {payer_line_user_id}")
 
     except IntegrityError as ie:
-        db.rollback(); logger.error(f"DB完整性錯誤(新增支出 v2.8.0): {ie}", exc_info=True)
+        db.rollback(); logger.error(f"DB完整性錯誤(新增支出 v2.8.2): {ie}", exc_info=True)
         line_bot_api.reply_message(reply_token, TextSendMessage(text="新增支出失敗，重複資料或成員關聯無效。"))
     except Exception as e:
-        db.rollback(); logger.exception(f"新增支出時意外錯誤 (v2.8.0): {e}")
+        db.rollback(); logger.exception(f"新增支出時意外錯誤 (v2.8.2): {e}")
         line_bot_api.reply_message(reply_token, TextSendMessage(text="新增支出時發生意外錯誤。"))
 
 def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
@@ -502,33 +553,476 @@ def handle_my_debts_v280(reply_token: str, sender_line_user_id: str, group_id: s
     full_reply = "\n".join(reply_items)
     line_bot_api.reply_message(reply_token, TextSendMessage(text=full_reply[:4950] + ("..." if len(full_reply)>4950 else "")))
 
-def send_splitbill_help_v280(reply_token: str):
-    """幫助訊息"""
+def handle_complete_settlement_v282(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
+    """
+    全面結算功能 v2.8.2：
+    - 處理付款人的所有相關帳單
+    - 自動封存已結清的帳單
+    - 提供完整的結算報告
+    - 確保資料庫狀態一致性
+    """
+    operation_hash = generate_operation_hash(sender_line_user_id, "complete_settlement", group_id)
+
+    if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=2):
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 偵測到重複結算操作，請稍等片刻再試。"))
+        return
+
+    log_operation(db, operation_hash, group_id, sender_line_user_id, "complete_settlement")
+
+    # 獲取發送者資訊
+    sender_display_name = "您"
+    try:
+        profile = line_bot_api.get_group_member_profile(group_id, sender_line_user_id)
+        sender_display_name = f"@{profile.display_name}"
+    except Exception: 
+        logger.warning(f"無法獲取 {sender_line_user_id} 在群組 {group_id} 的名稱。")
+
+    # 查找發送者在該群組中的成員記錄
+    payer_member = db.query(GroupMember).filter(
+        GroupMember.line_user_id == sender_line_user_id,
+        GroupMember.group_id == group_id
+    ).first()
+
+    if not payer_member:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="找不到您在本群組的成員記錄，請先建立一筆帳單。"))
+        return
+
+    # 獲取所有由該成員付款且未封存的帳單
+    payer_bills = db.query(Bill).options(
+        joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
+    ).filter(
+        Bill.payer_member_id == payer_member.id,
+        Bill.group_id == group_id,
+        Bill.is_archived == False
+    ).order_by(Bill.created_at.asc()).all()
+
+    if not payer_bills:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"{sender_display_name} 目前沒有需要結算的帳單。"))
+        return
+
+    # 開始結算處理
+    settlement_summary = {
+        'total_bills': len(payer_bills),
+        'fully_paid_bills': 0,
+        'partially_paid_bills': 0,
+        'unpaid_bills': 0,
+        'archived_bills': 0,
+        'total_amount': Decimal(0),
+        'total_received': Decimal(0),
+        'total_pending': Decimal(0)
+    }
+
+    settlement_details = []
+
+    try:
+        for bill in payer_bills:
+            bill_total = bill.total_bill_amount
+            bill_received = Decimal(0)
+            bill_pending = Decimal(0)
+            paid_count = 0
+            total_participants = len(bill.participants)
+
+            # 統計每筆帳單的付款狀況
+            for participant in bill.participants:
+                if participant.is_paid:
+                    bill_received += participant.amount_owed
+                    paid_count += 1
+                else:
+                    bill_pending += participant.amount_owed
+
+            settlement_summary['total_amount'] += bill_total
+            settlement_summary['total_received'] += bill_received
+            settlement_summary['total_pending'] += bill_pending
+
+            # 分類帳單狀態
+            if total_participants == 0:
+                # 無參與人的帳單（只有付款人）
+                settlement_summary['fully_paid_bills'] += 1
+                settlement_details.append(f"B-{bill.id}: {bill.description[:15]}... (無其他參與人)")
+                
+                # 自動封存無參與人的帳單
+                bill.is_archived = True
+                bill.updated_at = datetime.now(timezone.utc)
+                settlement_summary['archived_bills'] += 1
+                
+            elif paid_count == total_participants:
+                # 已全部付清
+                settlement_summary['fully_paid_bills'] += 1
+                settlement_details.append(f"✅ B-{bill.id}: {bill.description[:15]}... (已結清 {bill_received:.2f})")
+                
+                # 自動封存已結清的帳單
+                bill.is_archived = True
+                bill.updated_at = datetime.now(timezone.utc)
+                settlement_summary['archived_bills'] += 1
+                
+            elif paid_count > 0:
+                # 部分付清
+                settlement_summary['partially_paid_bills'] += 1
+                settlement_details.append(f"🔄 B-{bill.id}: {bill.description[:15]}... (已收 {bill_received:.2f}/剩餘 {bill_pending:.2f})")
+                
+            else:
+                # 完全未付
+                settlement_summary['unpaid_bills'] += 1
+                settlement_details.append(f"⭕ B-{bill.id}: {bill.description[:15]}... (待收 {bill_pending:.2f})")
+
+        # 提交所有更改
+        db.commit()
+        
+        # 生成結算報告
+        report_lines = [
+            f"--- 💰 {sender_display_name} 全面結算報告 ---",
+            f"",
+            f"📊 統計摘要:",
+            f"• 總帳單數: {settlement_summary['total_bills']} 筆",
+            f"• 已結清: {settlement_summary['fully_paid_bills']} 筆",
+            f"• 部分付款: {settlement_summary['partially_paid_bills']} 筆", 
+            f"• 完全未付: {settlement_summary['unpaid_bills']} 筆",
+            f"• 自動封存: {settlement_summary['archived_bills']} 筆",
+            f"",
+            f"💵 金額摘要:",
+            f"• 支出總額: {settlement_summary['total_amount']:.2f}",
+            f"• 已收回: {settlement_summary['total_received']:.2f}",
+            f"• 待收回: {settlement_summary['total_pending']:.2f}",
+            f"",
+            f"📋 帳單詳情:"
+        ]
+        
+        # 添加帳單詳情
+        for detail in settlement_details[:10]:  # 限制顯示數量避免訊息過長
+            report_lines.append(f"  {detail}")
+            
+        if len(settlement_details) > 10:
+            report_lines.append(f"  ... 以及其他 {len(settlement_details) - 10} 筆帳單")
+
+        report_lines.extend([
+            f"",
+            f"✨ 結算完成！已自動封存 {settlement_summary['archived_bills']} 筆結清帳單。",
+            f"📱 使用 #帳單列表 查看剩餘待處理帳單。"
+        ])
+
+        full_report = "\n".join(report_lines)
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=full_report[:4950] + ("..." if len(full_report)>4950 else "")))
+        
+        logger.info(f"完成全面結算 - 用戶: {sender_line_user_id}, 群組: {group_id}, 處理帳單: {settlement_summary['total_bills']} 筆, 封存: {settlement_summary['archived_bills']} 筆")
+
+    except Exception as e:
+        db.rollback()
+        logger.exception(f"全面結算時發生錯誤 - 用戶: {sender_line_user_id}, 群組: {group_id}: {e}")
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="結算過程中發生錯誤，請稍後再試。"))
+
+def send_splitbill_help_v282(reply_token: str):
+    """v2.8.2 更新的幫助訊息"""
     help_text = (
-        "--- 💸 分帳機器人指令 (v2.8.0) --- \n\n"
-        "🔸 新增支出 (付款人為您自己):\n"
+        "--- 💸 分帳機器人指令 (v2.8.2) --- \n\n"
+        "🔸 新增支出 (您自動參與分攤):\n"
         "  `#新增支出 <總金額> <說明> @參與人A @參與人B...` (均攤)\n"
-        "    例: `#新增支出 300 午餐 @陳小美 @林真心`\n\n"
+        "    例: `#新增支出 300 午餐 @小美 @小王`\n"
+        "    → 您和2位朋友均攤，每人100元\n\n"
         "  `#新增支出 <總金額> <說明> @參與人A <金額A> @參與人B <金額B>...` (分別計算)\n"
-        "    例: `#新增支出 1000 電影票 @小王 300 @小李 350 @自己 350`\n"
-        "    (註: 所有指定金額加總需等於<總金額>)\n\n"
-        "🔸 查看列表:\n  `#帳單列表`\n\n"
-        "🔸 查看詳情:\n  `#支出詳情 B-ID`\n\n"
-        "🔸 查看個人欠款 (限目前群組):\n  `#我的欠款`\n\n"
-        "🔸 更新付款狀態 (限帳單原始付款人操作):\n  `#結帳 B-ID @已付成員1 @成員2...`\n\n"
-        "🔸 封存帳單 (限帳單原始付款人操作):\n  `#封存帳單 B-ID`\n\n"
+        "    例: `#新增支出 1000 聚餐 @小美 400 @小王 350`\n"
+        "    → 您負擔剩餘250元，小美400元，小王350元\n\n"
+        "💡 重要：\n"
+        "  • 您作為付款人會自動參與分攤\n"
+        "  • 不需要@自己（LINE不支援）\n"
+        "  • 專注於群組成員間的債務計算\n\n"
+        "🔸 視覺化選單:\n  `#選單` - 主選單\n  `#建立帳單` - 帳單建立精靈\n\n"
+        "🔸 查看功能:\n  `#帳單列表` - 查看所有帳單\n  `#支出詳情 B-ID` - 查看特定帳單\n  `#我的欠款` - 查看個人未付款項\n\n"
+        "🔸 結算功能:\n  `#結帳 B-ID @已付成員1 @成員2...` - 標記個別付款\n  `#全面結算` - 智慧結算所有帳單並自動封存\n  `#封存帳單 B-ID` - 手動封存帳單\n\n"
         "🔸 本說明:\n  `#幫助`\n\n"
-        "✨ v2.8.0 新功能:\n"
-        "- 修復群組資料隔離問題\n"
-        "- 防止重複操作和帳單建立\n"
-        "- 改善資料庫效能和穩定性"
+        "✨ v2.8.2 新功能:\n"
+        "- 🎯 純粹的群組分帳計算邏輯\n"
+        "- 🚫 移除@自己相關的多餘程式碼\n"
+        "- 💰 全面結算功能：一鍵處理所有帳單\n"
+        "- 🔒 強化的資料庫完整性和一致性\n"
+        "- 🛡️ 完善的記帳到結帳工作流程"
     )
     line_bot_api.reply_message(reply_token, TextSendMessage(text=help_text))
+
+def send_flex_main_menu_v280(reply_token: str):
+    """發送主選單Flex Message"""
+    flex_message = {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "💸 分帳機器人",
+                    "weight": "bold",
+                    "size": "xl",
+                    "color": "#2E7D32"
+                },
+                {
+                    "type": "text",
+                    "text": "v2.8.2",
+                    "size": "sm",
+                    "color": "#666666"
+                }
+            ],
+            "paddingAll": "20px",
+            "backgroundColor": "#E8F5E8"
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "選擇您要使用的功能：",
+                    "size": "md",
+                    "margin": "md"
+                },
+                {
+                    "type": "separator",
+                    "margin": "lg"
+                }
+            ],
+            "paddingAll": "20px"
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "🆕 建立帳單",
+                        "text": "#建立帳單"
+                    },
+                    "color": "#4CAF50"
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "📋 查看帳單列表",
+                        "text": "#帳單列表"
+                    }
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "💰 我的欠款",
+                        "text": "#我的欠款"
+                    }
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "🎯 全面結算",
+                        "text": "#全面結算"
+                    }
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "❓ 使用說明",
+                        "text": "#幫助"
+                    }
+                }
+            ],
+            "paddingAll": "20px"
+        }
+    }
+    
+    line_bot_api.reply_message(
+        reply_token,
+        FlexSendMessage(alt_text="分帳機器人主選單", contents=flex_message)
+    )
+
+def send_flex_create_bill_menu_v280(reply_token: str):
+    """發送建立帳單選單Flex Message"""
+    flex_message = {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "🆕 建立新帳單",
+                    "weight": "bold",
+                    "size": "xl",
+                    "color": "#2E7D32"
+                },
+                {
+                    "type": "text",
+                    "text": "選擇分帳方式",
+                    "size": "sm",
+                    "color": "#666666"
+                }
+            ],
+            "paddingAll": "20px",
+            "backgroundColor": "#E8F5E8"
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "📌 均攤模式",
+                            "weight": "bold",
+                            "size": "md",
+                            "color": "#2E7D32"
+                        },
+                        {
+                            "type": "text",
+                            "text": "所有人平均分攤費用",
+                            "size": "sm",
+                            "color": "#666666",
+                            "margin": "xs"
+                        },
+                        {
+                            "type": "text",
+                            "text": "範例: 午餐 300元，3人分攤",
+                            "size": "xs",
+                            "color": "#999999",
+                            "margin": "xs"
+                        }
+                    ],
+                    "backgroundColor": "#F5F5F5",
+                    "paddingAll": "15px",
+                    "cornerRadius": "8px",
+                    "margin": "md"
+                },
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": "🎯 分別計算模式",
+                            "weight": "bold",
+                            "size": "md",
+                            "color": "#FF9800"
+                        },
+                        {
+                            "type": "text",
+                            "text": "每人負擔不同金額",
+                            "size": "sm",
+                            "color": "#666666",
+                            "margin": "xs"
+                        },
+                        {
+                            "type": "text",
+                            "text": "範例: 點餐各自不同價格",
+                            "size": "xs",
+                            "color": "#999999",
+                            "margin": "xs"
+                        }
+                    ],
+                    "backgroundColor": "#FFF8E1",
+                    "paddingAll": "15px",
+                    "cornerRadius": "8px",
+                    "margin": "md"
+                }
+            ],
+            "paddingAll": "20px"
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "📝 指令格式：",
+                    "weight": "bold",
+                    "size": "sm",
+                    "margin": "md"
+                },
+                {
+                    "type": "text",
+                    "text": "均攤：#新增支出 300 午餐 @小美 @小王",
+                    "size": "xs",
+                    "color": "#666666",
+                    "wrap": True,
+                    "margin": "xs"
+                },
+                {
+                    "type": "text",
+                    "text": "分別：#新增支出 1000 聚餐 @小美 400 @小王 350",
+                    "size": "xs",
+                    "color": "#666666",
+                    "wrap": True,
+                    "margin": "xs"
+                },
+                {
+                    "type": "text",
+                    "text": "💡 您會自動參與分攤，無需@自己",
+                    "size": "xs",
+                    "color": "#FF9800",
+                    "wrap": True,
+                    "margin": "sm"
+                },
+                {
+                    "type": "separator",
+                    "margin": "lg"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        {
+                            "type": "button",
+                            "style": "secondary",
+                            "height": "sm",
+                            "action": {
+                                "type": "message",
+                                "label": "🔙 返回選單",
+                                "text": "#選單"
+                            },
+                            "flex": 1
+                        },
+                        {
+                            "type": "button",
+                            "style": "secondary",
+                            "height": "sm",
+                            "action": {
+                                "type": "message",
+                                "label": "❓ 詳細說明",
+                                "text": "#幫助"
+                            },
+                            "flex": 1
+                        }
+                    ]
+                }
+            ],
+            "paddingAll": "20px"
+        }
+    }
+    
+    line_bot_api.reply_message(
+        reply_token,
+        FlexSendMessage(alt_text="建立帳單選單", contents=flex_message)
+    )
 
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 7777)) 
     host = '0.0.0.0'
-    logger.info(f"分帳Bot Flask 應用 (開發伺服器 v2.8.0) 啟動於 host={host}, port={port}")
+    logger.info(f"分帳Bot Flask 應用 (開發伺服器 v2.8.2) 啟動於 host={host}, port={port}")
     try:
         app.run(host=host, port=port, debug=True) 
     except Exception as e:
