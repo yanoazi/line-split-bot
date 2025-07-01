@@ -408,7 +408,7 @@ def handle_add_bill_v284(reply_token: str, match: re.Match, group_id: str, payer
         logger.error(f"新增帳單失敗 - 狀態: {status}, 群組: {group_id}, 付款人: {payer_line_user_id}")
 
 def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
-    """列出帳單功能，加入重複操作防護"""
+    """列出帳單功能，使用Flex Message呈現"""
     operation_hash = generate_operation_hash(sender_line_user_id, "list_bills", group_id)
 
     if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
@@ -417,25 +417,274 @@ def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id:
     log_operation(db, operation_hash, group_id, sender_line_user_id, "list_bills")
 
     bills = get_active_bills_by_group(db, group_id)
-    if not bills: 
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="目前無待處理帳單。"))
+    
+    if not bills:
+        # 無帳單的Flex Message
+        flex_message = {
+            "type": "bubble",
+            "header": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "📋 帳單列表",
+                        "weight": "bold",
+                        "size": "xl",
+                        "color": "#4CAF50"
+                    }
+                ],
+                "paddingAll": "20px",
+                "backgroundColor": "#E8F5E8"
+            },
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "box",
+                        "layout": "vertical",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": "🎉",
+                                "size": "xxl",
+                                "align": "center",
+                                "margin": "md"
+                            },
+                            {
+                                "type": "text",
+                                "text": "群組乾淨！",
+                                "size": "lg",
+                                "weight": "bold",
+                                "align": "center",
+                                "color": "#4CAF50",
+                                "margin": "md"
+                            },
+                            {
+                                "type": "text",
+                                "text": "目前沒有任何待處理帳單",
+                                "size": "md",
+                                "align": "center",
+                                "color": "#666666",
+                                "wrap": True,
+                                "margin": "md"
+                            }
+                        ],
+                        "backgroundColor": "#F5F5F5",
+                        "paddingAll": "20px",
+                        "cornerRadius": "10px"
+                    }
+                ],
+                "paddingAll": "20px"
+            }
+        }
+        line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text="帳單列表 - 無待處理帳單", contents=flex_message))
         return
+
+    # 計算總帳單數和已結清數
+    total_bills = len(bills)
+    cleared_bills = sum(1 for bill in bills if bill.participants and all(p.is_paid for p in bill.participants))
+    
+    # 構建帳單清單（最多顯示8筆）
+    bill_contents = []
+    for i, bill in enumerate(bills[:8]):
+        if i > 0:
+            bill_contents.append({"type": "separator", "margin": "md"})
         
-    reply_items = [f"--- 📜 本群組帳單列表 (未封存) ---"]
-    for bill in bills:
-        item = (f"\nID: B-{bill.id} | {bill.description}\n"
-                f"付款人: @{bill.payer_member_profile.name} | 總額: {bill.total_bill_amount:.2f}\n")
-        all_paid_for_bill = True if bill.participants else False
-        if not bill.participants: item += "  (尚無參與人)"
+        # 計算此帳單的付款狀況
+        paid_count = sum(1 for p in bill.participants if p.is_paid)
+        total_participants = len(bill.participants)
+        
+        # 狀態顏色和圖示
+        if total_participants == 0:
+            status_color = "#999999"
+            status_icon = "⚪"
+            status_text = "無參與人"
+        elif paid_count == total_participants:
+            status_color = "#4CAF50"
+            status_icon = "✅"
+            status_text = "已結清"
+        elif paid_count > 0:
+            status_color = "#FF9800"
+            status_icon = "🔄"
+            status_text = f"{paid_count}/{total_participants}"
         else:
-            for p in bill.participants:
-                item += f"\n  @{p.debtor_member_profile.name}: {p.amount_owed:.2f} ({'✅已付' if p.is_paid else '🅾️未付'})"
-                if not p.is_paid: all_paid_for_bill = False
-        if all_paid_for_bill and bill.participants: item += "\n✨ 此帳單已結清！"
-        item += f"\n(詳情: #支出詳情 B-{bill.id})"
-        reply_items.append(item)
-    full_reply = "\n".join(reply_items)
-    line_bot_api.reply_message(reply_token, TextSendMessage(text=full_reply[:4950] + ("..." if len(full_reply)>4950 else "")))
+            status_color = "#F44336"
+            status_icon = "⭕"
+            status_text = "未付款"
+        
+        bill_contents.extend([
+            {
+                "type": "box",
+                "layout": "horizontal",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": f"B-{bill.id}",
+                        "size": "sm",
+                        "color": "#2196F3",
+                        "weight": "bold",
+                        "flex": 1
+                    },
+                    {
+                        "type": "text",
+                        "text": f"{status_icon} {status_text}",
+                        "size": "sm",
+                        "color": status_color,
+                        "weight": "bold",
+                        "align": "end",
+                        "flex": 1
+                    }
+                ],
+                "margin": "sm"
+            },
+            {
+                "type": "text",
+                "text": bill.description[:25] + ("..." if len(bill.description) > 25 else ""),
+                "size": "md",
+                "color": "#333333",
+                "weight": "bold",
+                "margin": "xs"
+            },
+            {
+                "type": "box",
+                "layout": "horizontal",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": f"付款人: @{bill.payer_member_profile.name}",
+                        "size": "xs",
+                        "color": "#666666",
+                        "flex": 1
+                    },
+                    {
+                        "type": "text",
+                        "text": f"${int(bill.total_bill_amount)}",
+                        "size": "sm",
+                        "color": "#FF9800",
+                        "weight": "bold",
+                        "align": "end",
+                        "flex": 1
+                    }
+                ],
+                "margin": "xs"
+            },
+            {
+                "type": "text",
+                "text": f"{'均攤' if bill.split_type == SplitType.EQUAL else '分別計算'} | {bill.created_at.strftime('%m/%d %H:%M') if bill.created_at else 'N/A'}",
+                "size": "xs",
+                "color": "#999999",
+                "margin": "xs"
+            }
+        ])
+    
+    if len(bills) > 8:
+        bill_contents.extend([
+            {"type": "separator", "margin": "md"},
+            {
+                "type": "text",
+                "text": f"... 還有 {len(bills) - 8} 筆帳單",
+                "size": "xs",
+                "color": "#999999",
+                "align": "center",
+                "margin": "sm"
+            }
+        ])
+
+    flex_message = {
+        "type": "bubble",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "📋 帳單列表",
+                    "weight": "bold",
+                    "size": "xl",
+                    "color": "#2196F3"
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": f"共 {total_bills} 筆帳單",
+                            "size": "sm",
+                            "color": "#666666",
+                            "flex": 1
+                        },
+                        {
+                            "type": "text",
+                            "text": f"已結清 {cleared_bills} 筆",
+                            "size": "sm",
+                            "color": "#4CAF50",
+                            "weight": "bold",
+                            "align": "end",
+                            "flex": 1
+                        }
+                    ],
+                    "margin": "sm"
+                }
+            ],
+            "paddingAll": "20px",
+            "backgroundColor": "#E3F2FD"
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "帳單明細 (按建立時間排序)",
+                    "size": "md",
+                    "weight": "bold",
+                    "margin": "md"
+                },
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "contents": bill_contents,
+                    "margin": "md"
+                }
+            ],
+            "paddingAll": "20px"
+        },
+        "footer": {
+            "type": "box",
+            "layout": "horizontal",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "💸 我的欠款",
+                        "text": "#我的欠款"
+                    },
+                    "flex": 1
+                },
+                {
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "👥 群組欠款",
+                        "text": "#群組欠款"
+                    },
+                    "flex": 1
+                }
+            ],
+            "paddingAll": "15px"
+        }
+    }
+    
+    line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text=f"帳單列表 - 共 {total_bills} 筆", contents=flex_message))
 
 def handle_bill_details_v280(reply_token: str, bill_db_id: int, group_id: str, sender_line_user_id: str, db: Session):
     """帳單詳情功能，確保群組隔離"""
