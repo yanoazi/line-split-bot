@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import enum
 import hashlib
+import time
 
 class SplitType(enum.Enum):
     EQUAL = "equal"      # 均攤
@@ -44,10 +45,6 @@ def get_db_splitbill():
         raise
     finally:
         db.close()
-
-class SplitType(enum.Enum):
-    EQUAL = "equal"
-    UNEQUAL = "unequal"
 
 class GroupMember(Base):
     __tablename__ = "sb_group_members"
@@ -197,54 +194,107 @@ def init_db_splitbill():
 def get_or_create_member_by_line_id(db: Session, line_user_id: str, group_id: str, display_name: str) -> GroupMember:
     """
     根據LINE User ID在特定群組中獲取或創建成員
-    修復：移除全域唯一性約束，允許同一用戶在多個群組中存在
+    v2.8.4 強化：修復併發競爭條件問題
     """
-    # 先在特定群組中查找該LINE用戶
-    member = db.query(GroupMember).filter(
-        GroupMember.line_user_id == line_user_id,
-        GroupMember.group_id == group_id
-    ).first()
+    # 使用重試機制處理競爭條件
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 先在特定群組中查找該LINE用戶
+            member = db.query(GroupMember).filter(
+                GroupMember.line_user_id == line_user_id,
+                GroupMember.group_id == group_id
+            ).first()
 
-    if not member:
-        # 檢查是否有同名成員（無LINE ID）存在於該群組
-        existing_member_by_name = db.query(GroupMember).filter(
-            GroupMember.name == display_name,
-            GroupMember.group_id == group_id,
-            GroupMember.line_user_id.is_(None)
-        ).first()
-        
-        if existing_member_by_name:
-            logger.info(f"找到現有成員 @{display_name} (ID: {existing_member_by_name.id}) 在群組 {group_id}，更新其 LINE User ID 為 {line_user_id}。")
-            existing_member_by_name.line_user_id = line_user_id
-            existing_member_by_name.updated_at = datetime.now(timezone.utc)
-            if existing_member_by_name.name != display_name:
-                existing_member_by_name.name = display_name
-            member = existing_member_by_name
-        else:
+            if member:
+                # 如果找到成員但名稱不同，更新名稱
+                if member.name != display_name:
+                    logger.info(f"成員 (LINE ID: {line_user_id}) 在群組 {group_id} 的顯示名稱已從 @{member.name} 更新為 @{display_name}。")
+                    member.name = display_name
+                    member.updated_at = datetime.now(timezone.utc)
+                return member
+
+            # 檢查是否有同名成員（無LINE ID）存在於該群組
+            existing_member_by_name = db.query(GroupMember).filter(
+                GroupMember.name == display_name,
+                GroupMember.group_id == group_id,
+                GroupMember.line_user_id.is_(None)
+            ).first()
+            
+            if existing_member_by_name:
+                logger.info(f"找到現有成員 @{display_name} (ID: {existing_member_by_name.id}) 在群組 {group_id}，更新其 LINE User ID 為 {line_user_id}。")
+                existing_member_by_name.line_user_id = line_user_id
+                existing_member_by_name.updated_at = datetime.now(timezone.utc)
+                if existing_member_by_name.name != display_name:
+                    existing_member_by_name.name = display_name
+                db.flush()  # 確保更新被持久化
+                return existing_member_by_name
+            
+            # 創建新成員
             logger.info(f"新成員 (LINE ID: {line_user_id}, 名稱: @{display_name}) 在群組 {group_id} 中，將自動建立。")
             member = GroupMember(name=display_name, group_id=group_id, line_user_id=line_user_id)
             db.add(member)
-    elif member.name != display_name:
-        logger.info(f"成員 (LINE ID: {line_user_id}) 在群組 {group_id} 的顯示名稱已從 @{member.name} 更新為 @{display_name}。")
-        member.name = display_name
-        member.updated_at = datetime.now(timezone.utc)
-        
-    return member
+            db.flush()  # 立即獲取ID
+            return member
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'unique constraint' in error_msg and attempt < max_retries - 1:
+                # 如果是唯一約束錯誤，可能是併發創建，重試查詢
+                logger.warning(f"成員創建遇到併發衝突 (嘗試 {attempt + 1}/{max_retries})，重試查詢: {e}")
+                db.rollback()
+                time.sleep(0.01 * (attempt + 1))  # 短暫延遲後重試
+                continue
+            else:
+                logger.error(f"創建/獲取成員失敗 (嘗試 {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise
+                db.rollback()
+                time.sleep(0.01 * (attempt + 1))
+    
+    # 如果所有重試都失敗，拋出異常
+    raise Exception(f"無法創建或獲取成員 (LINE ID: {line_user_id}, 群組: {group_id}) 在 {max_retries} 次嘗試後")
 
 def get_or_create_member_by_name(db: Session, name: str, group_id: str) -> GroupMember:
     """
     根據名稱在特定群組中獲取或創建成員
+    v2.8.4 強化：添加重試機制處理競爭條件
     """
-    member = db.query(GroupMember).filter(
-        GroupMember.name == name,
-        GroupMember.group_id == group_id
-    ).first()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            member = db.query(GroupMember).filter(
+                GroupMember.name == name,
+                GroupMember.group_id == group_id
+            ).first()
 
-    if not member:
-        logger.info(f"成員 @{name} 在群組 {group_id} 中不存在 (透過名稱查找)，將自動建立 (無 LINE User ID)。")
-        member = GroupMember(name=name, group_id=group_id, line_user_id=None)
-        db.add(member)
-    return member
+            if member:
+                return member
+            
+            # 創建新成員
+            logger.info(f"成員 @{name} 在群組 {group_id} 中不存在 (透過名稱查找)，將自動建立 (無 LINE User ID)。")
+            member = GroupMember(name=name, group_id=group_id, line_user_id=None)
+            db.add(member)
+            db.flush()  # 立即獲取ID
+            return member
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            if 'unique constraint' in error_msg and attempt < max_retries - 1:
+                # 如果是唯一約束錯誤，可能是併發創建，重試查詢
+                logger.warning(f"成員創建遇到併發衝突 (嘗試 {attempt + 1}/{max_retries})，重試查詢: {e}")
+                db.rollback()
+                time.sleep(0.01 * (attempt + 1))  # 短暫延遲後重試
+                continue
+            else:
+                logger.error(f"創建/獲取成員失敗 (嘗試 {attempt + 1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    raise
+                db.rollback()
+                time.sleep(0.01 * (attempt + 1))
+    
+    # 如果所有重試都失敗，拋出異常
+    raise Exception(f"無法創建或獲取成員 (名稱: {name}, 群組: {group_id}) 在 {max_retries} 次嘗試後")
 
 def get_bill_by_id(db: Session, bill_id: int, group_id: str) -> Optional[Bill]:
     """獲取特定群組中的帳單"""
@@ -345,60 +395,89 @@ def generate_content_hash_v284(payer_id: int, description: str, amount: str, par
 
 def atomic_create_bill_v284(db: Session, bill_data: dict, participants_data: List[dict]) -> tuple:
     """
-    原子性創建帳單：
+    原子性創建帳單 v2.8.4 強化版：
     - 使用資料庫事務確保一致性
     - 處理重複約束違反
+    - 添加重試機制處理併發情況
     - 返回創建結果和狀態
     """
-    try:
-        # 在事務開始時再次檢查重複（雙重檢查）
-        existing_bill = db.query(Bill).filter(
-            Bill.group_id == bill_data['group_id'],
-            Bill.content_hash == bill_data['content_hash']
-        ).first()
-        
-        if existing_bill:
-            logger.warning(f"事務中發現重複帳單 B-{existing_bill.id}")
-            return None, "duplicate_found"
-        
-        # 創建帳單
-        new_bill = Bill(**bill_data)
-        db.add(new_bill)
-        db.flush()  # 獲取新帳單ID但不提交
-        
-        # 創建參與人記錄
-        for participant_data in participants_data:
-            participant_data['bill_id'] = new_bill.id
-            participant = BillParticipant(**participant_data)
-            db.add(participant)
-        
-        # 提交事務
-        db.commit()
-        
-        # 重新查詢完整的帳單資料
-        complete_bill = db.query(Bill).options(
-            joinedload(Bill.payer_member_profile),
-            joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
-        ).filter(Bill.id == new_bill.id).first()
-        
-        logger.info(f"成功創建帳單 B-{new_bill.id} - Hash: {bill_data['content_hash']}")
-        return complete_bill, "success"
-        
-    except Exception as e:
-        db.rollback()
-        error_msg = str(e).lower()
-        
-        if 'unique constraint' in error_msg or 'duplicate' in error_msg:
-            logger.warning(f"資料庫唯一約束違反：{e}")
-            # 查找已存在的重複帳單
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 在事務開始時再次檢查重複（雙重檢查）
             existing_bill = db.query(Bill).filter(
                 Bill.group_id == bill_data['group_id'],
                 Bill.content_hash == bill_data['content_hash']
             ).first()
+            
             if existing_bill:
-                return existing_bill, "duplicate_constraint"
-            else:
+                logger.warning(f"事務中發現重複帳單 B-{existing_bill.id} (嘗試 {attempt + 1})")
+                # 返回完整的帳單資料
+                complete_existing_bill = db.query(Bill).options(
+                    joinedload(Bill.payer_member_profile),
+                    joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
+                ).filter(Bill.id == existing_bill.id).first()
+                return complete_existing_bill, "duplicate_found"
+            
+            # 創建帳單
+            new_bill = Bill(**bill_data)
+            db.add(new_bill)
+            db.flush()  # 獲取新帳單ID但不提交
+            
+            # 創建參與人記錄
+            for participant_data in participants_data:
+                participant_data_copy = participant_data.copy()  # 避免修改原始數據
+                participant_data_copy['bill_id'] = new_bill.id
+                participant = BillParticipant(**participant_data_copy)
+                db.add(participant)
+            
+            # 提交事務
+            db.commit()
+            
+            # 重新查詢完整的帳單資料
+            complete_bill = db.query(Bill).options(
+                joinedload(Bill.payer_member_profile),
+                joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
+            ).filter(Bill.id == new_bill.id).first()
+            
+            logger.info(f"成功創建帳單 B-{new_bill.id} - Hash: {bill_data['content_hash']} (嘗試 {attempt + 1})")
+            return complete_bill, "success"
+            
+        except Exception as e:
+            db.rollback()
+            error_msg = str(e).lower()
+            
+            if ('unique constraint' in error_msg or 'duplicate' in error_msg) and 'content_hash' in error_msg:
+                logger.warning(f"資料庫唯一約束違反 (嘗試 {attempt + 1}/{max_retries})：{e}")
+                
+                # 重新查找已存在的重複帳單
+                try:
+                    existing_bill = db.query(Bill).options(
+                        joinedload(Bill.payer_member_profile),
+                        joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
+                    ).filter(
+                        Bill.group_id == bill_data['group_id'],
+                        Bill.content_hash == bill_data['content_hash']
+                    ).first()
+                    
+                    if existing_bill:
+                        logger.info(f"找到已存在的重複帳單 B-{existing_bill.id}")
+                        return existing_bill, "duplicate_constraint"
+                except Exception as query_error:
+                    logger.error(f"查詢重複帳單時發生錯誤：{query_error}")
+                
                 return None, "constraint_error"
-        else:
-            logger.exception(f"創建帳單時發生未預期錯誤：{e}")
-            return None, "unexpected_error"
+                
+            elif attempt < max_retries - 1:
+                # 其他錯誤且還有重試機會
+                logger.warning(f"創建帳單遇到錯誤 (嘗試 {attempt + 1}/{max_retries})，將重試：{e}")
+                time.sleep(0.01 * (attempt + 1))  # 短暫延遲後重試
+                continue
+            else:
+                # 最後一次嘗試失敗
+                logger.exception(f"創建帳單時發生未預期錯誤 (最終嘗試)：{e}")
+                return None, "unexpected_error"
+    
+    # 如果所有重試都失敗
+    logger.error(f"無法創建帳單在 {max_retries} 次嘗試後")
+    return None, "max_retries_exceeded"
