@@ -1,4 +1,4 @@
-# app_splitbill.py (v1.0 - Production Release)
+# app_splitbill.py (v1.0.2 - 重複帳單修復版)
 from flask import Flask, request, abort, jsonify
 import os
 import re
@@ -48,14 +48,14 @@ if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
 try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    logger.info("LINE Bot API 初始化成功 (v1.0)。")
+    logger.info("LINE Bot API 初始化成功 (v1.0.2 - 重複帳單修復版)。")
 except Exception as e:
     logger.exception(f"初始化 LINE SDK 失敗: {e}")
     exit(1)
 
 try:
     init_db()
-    logger.info("分帳資料庫初始化檢查完成 (v1.0)。")
+    logger.info("分帳資料庫初始化檢查完成 (v1.0.2 - 重複帳單修復版)。")
 except Exception as e:
     logger.exception(f"分帳資料庫初始化失敗: {e}")
 
@@ -290,7 +290,8 @@ def handle_text_message(event: MessageEvent):
 
 def handle_add_bill_v284(reply_token: str, match: re.Match, group_id: str, payer_line_user_id: str, payer_mention_name: str, db: Session):
     """
-    新增帳單功能 v1.0 - 使用資料庫約束徹底防止重複：
+    新增帳單功能 v1.0.2 - 強化重複防護：
+    - 早期重複操作檢查
     - 資料庫層面唯一約束
     - 原子性事務處理
     - 強化的內容hash生成
@@ -299,6 +300,20 @@ def handle_add_bill_v284(reply_token: str, match: re.Match, group_id: str, payer
     total_amount_str = match.group(1)
     description = match.group(2).strip()
     participants_input_str = match.group(3).strip()
+
+    # === 早期重複操作檢查 ===
+    # 生成操作hash用於檢查重複操作（在解析參數之前就檢查）
+    operation_content = f"add_bill:{total_amount_str}:{description}:{participants_input_str}"
+    operation_hash = generate_operation_hash(payer_line_user_id, "add_bill", operation_content)
+    
+    # 檢查是否為重複操作（30秒內）
+    if is_duplicate_operation(db, operation_hash, group_id, payer_line_user_id, time_window_minutes=0.5):
+        logger.warning(f"阻止重複新增帳單操作 - 用戶: {payer_line_user_id}, 群組: {group_id}")
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 偵測到重複操作，請稍候再試。"))
+        return
+    
+    # 記錄操作
+    log_operation(db, operation_hash, group_id, payer_line_user_id, "add_bill")
 
     logger.info(f"處理新增帳單請求 - 用戶: {payer_line_user_id}, 群組: {group_id}, 描述: {description}")
 
@@ -333,6 +348,31 @@ def handle_add_bill_v284(reply_token: str, match: re.Match, group_id: str, payer
         participants_str=participants_input_str,
         group_id=group_id
     )
+
+    # === 雙重內容檢查 ===
+    # 在創建之前再次檢查是否有相同內容的帳單存在
+    existing_content_bill = db.query(Bill).filter(
+        Bill.group_id == group_id,
+        Bill.content_hash == content_hash
+    ).first()
+    
+    if existing_content_bill:
+        logger.warning(f"發現相同內容帳單已存在 B-{existing_content_bill.id}")
+        # 查詢完整資料用於回覆
+        complete_existing_bill = db.query(Bill).options(
+            joinedload(Bill.payer_member_profile),
+            joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
+        ).filter(Bill.id == existing_content_bill.id).first()
+        
+        reply_msg = (
+            f"⚠️ 相同內容的帳單已存在！\n"
+            f"帳單 B-{complete_existing_bill.id}: {complete_existing_bill.description}\n"
+            f"金額: {complete_existing_bill.total_bill_amount:.2f}\n"
+            f"建立時間: {complete_existing_bill.created_at.strftime('%m/%d %H:%M') if complete_existing_bill.created_at else 'N/A'}\n\n"
+            f"如需查看詳情請使用: #支出詳情 B-{complete_existing_bill.id}"
+        )
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_msg))
+        return
 
     # 準備帳單資料
     bill_data = {
