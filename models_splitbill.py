@@ -12,6 +12,10 @@ from datetime import datetime, timedelta, timezone
 import enum
 import hashlib
 
+class SplitType(enum.Enum):
+    EQUAL = "equal"      # 均攤
+    UNEQUAL = "unequal"  # 分別計算
+
 from dotenv import load_dotenv
 import logging
 
@@ -88,8 +92,8 @@ class Bill(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     is_archived = Column(Boolean, default=False, nullable=False)
     
-    # 新增：用於防止重複建立的hash值
-    content_hash = Column(String(64), nullable=True, index=True)
+    # 新增：用於防止重複建立的hash值 - 設為必填
+    content_hash = Column(String(64), nullable=False, index=True)
 
     # 關聯關係
     participants = relationship("BillParticipant", back_populates="bill", cascade="all, delete-orphan")
@@ -98,6 +102,8 @@ class Bill(Base):
         # 提升查詢效能的索引
         Index('ix_sb_bills_group_archived', 'group_id', 'is_archived'),
         Index('ix_sb_bills_group_created', 'group_id', 'created_at'),
+        # 新增：資料庫層面的重複防護 - 同一群組內相同content_hash只能有一筆
+        UniqueConstraint('group_id', 'content_hash', name='_sb_bill_content_unique'),
     )
 
     def __repr__(self):
@@ -299,3 +305,100 @@ def cleanup_old_duplicate_logs(db: Session, days_to_keep: int = 7):
         logger.info(f"清理了 {deleted_count} 筆舊的重複操作記錄")
     
     return deleted_count
+
+def generate_content_hash_v284(payer_id: int, description: str, amount: str, participants_str: str, group_id: str) -> str:
+    """
+    v2.8.4 強化版內容hash生成：
+    - 包含群組ID確保群組隔離
+    - 標準化描述（去除多餘空白、統一大小寫）
+    - 標準化金額格式
+    - 確保參與人排序一致性
+    """
+    # 標準化描述：去除多餘空白、轉小寫
+    normalized_description = ' '.join(description.strip().lower().split())
+    
+    # 標準化金額：確保格式一致
+    from decimal import Decimal
+    normalized_amount = str(Decimal(amount).quantize(Decimal('0.01')))
+    
+    # 標準化參與人：按名稱排序，格式統一
+    import re
+    mentions = re.findall(r'@(\S+)(?:\s+([\d\.]+))?', participants_str)
+    sorted_mentions = sorted(mentions, key=lambda x: x[0].lower())
+    
+    normalized_participants_parts = []
+    for name, amount_str in sorted_mentions:
+        if amount_str:
+            participant_amount = str(Decimal(amount_str).quantize(Decimal('0.01')))
+            normalized_participants_parts.append(f"@{name.lower()}:{participant_amount}")
+        else:
+            normalized_participants_parts.append(f"@{name.lower()}")
+    
+    normalized_participants = "|".join(normalized_participants_parts)
+    
+    # 生成hash：包含所有關鍵資訊
+    content = f"{group_id}:{payer_id}:{normalized_description}:{normalized_amount}:{normalized_participants}"
+    content_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    
+    logger.debug(f"生成content_hash: {content} -> {content_hash}")
+    return content_hash
+
+def atomic_create_bill_v284(db: Session, bill_data: dict, participants_data: List[dict]) -> tuple:
+    """
+    原子性創建帳單：
+    - 使用資料庫事務確保一致性
+    - 處理重複約束違反
+    - 返回創建結果和狀態
+    """
+    try:
+        # 在事務開始時再次檢查重複（雙重檢查）
+        existing_bill = db.query(Bill).filter(
+            Bill.group_id == bill_data['group_id'],
+            Bill.content_hash == bill_data['content_hash']
+        ).first()
+        
+        if existing_bill:
+            logger.warning(f"事務中發現重複帳單 B-{existing_bill.id}")
+            return None, "duplicate_found"
+        
+        # 創建帳單
+        new_bill = Bill(**bill_data)
+        db.add(new_bill)
+        db.flush()  # 獲取新帳單ID但不提交
+        
+        # 創建參與人記錄
+        for participant_data in participants_data:
+            participant_data['bill_id'] = new_bill.id
+            participant = BillParticipant(**participant_data)
+            db.add(participant)
+        
+        # 提交事務
+        db.commit()
+        
+        # 重新查詢完整的帳單資料
+        complete_bill = db.query(Bill).options(
+            joinedload(Bill.payer_member_profile),
+            joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
+        ).filter(Bill.id == new_bill.id).first()
+        
+        logger.info(f"成功創建帳單 B-{new_bill.id} - Hash: {bill_data['content_hash']}")
+        return complete_bill, "success"
+        
+    except Exception as e:
+        db.rollback()
+        error_msg = str(e).lower()
+        
+        if 'unique constraint' in error_msg or 'duplicate' in error_msg:
+            logger.warning(f"資料庫唯一約束違反：{e}")
+            # 查找已存在的重複帳單
+            existing_bill = db.query(Bill).filter(
+                Bill.group_id == bill_data['group_id'],
+                Bill.content_hash == bill_data['content_hash']
+            ).first()
+            if existing_bill:
+                return existing_bill, "duplicate_constraint"
+            else:
+                return None, "constraint_error"
+        else:
+            logger.exception(f"創建帳單時發生未預期錯誤：{e}")
+            return None, "unexpected_error"

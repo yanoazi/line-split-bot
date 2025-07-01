@@ -1,4 +1,4 @@
-# app_splitbill.py (v2.8.2 - Pure Group Bill Splitting & Complete Settlement)
+# app_splitbill.py (v2.8.4 - Database-Level Duplicate Prevention)
 from flask import Flask, request, abort, jsonify
 import os
 import re
@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from dotenv import load_dotenv
 import logging
 
-# 更新導入以包含新的重複操作防護功能
+# 更新導入以包含新的原子性創建功能
 from models_splitbill import (
     init_db_splitbill as init_db,
     get_db_splitbill as get_db,
@@ -18,8 +18,9 @@ from models_splitbill import (
     get_or_create_member_by_name,    
     get_bill_by_id, get_active_bills_by_group,
     get_unpaid_debts_for_member_by_line_id,
-    generate_content_hash, generate_operation_hash,
-    is_duplicate_operation, log_operation, cleanup_old_duplicate_logs
+    generate_content_hash_v284, generate_operation_hash,
+    is_duplicate_operation, log_operation, cleanup_old_duplicate_logs,
+    atomic_create_bill_v284
 )
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
@@ -47,18 +48,18 @@ if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
 try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    logger.info("LINE Bot API 初始化成功 (v2.8.2)。")
+    logger.info("LINE Bot API 初始化成功 (v2.8.4)。")
 except Exception as e:
     logger.exception(f"初始化 LINE SDK 失敗: {e}")
     exit(1)
 
 try:
     init_db()
-    logger.info("分帳資料庫初始化檢查完成 (v2.8.2)。")
+    logger.info("分帳資料庫初始化檢查完成 (v2.8.4)。")
 except Exception as e:
     logger.exception(f"分帳資料庫初始化失敗: {e}")
 
-# --- Regex Patterns (v2.8.0) ---
+# --- Regex Patterns (v2.8.4) ---
 ADD_BILL_PATTERN = r'^#新增支出\s+([\d\.]+)\s+(.+?)\s+((?:@\S+(?:\s+[\d\.]+)?\s*)+)$'
 LIST_BILLS_PATTERN = r'^#帳單列表$'
 BILL_DETAILS_PATTERN = r'^#支出詳情\s+B-(\d+)$'
@@ -71,6 +72,26 @@ FLEX_CREATE_BILL_PATTERN = r'^#建立帳單$'
 FLEX_MENU_PATTERN = r'^#選單$'
 # 新增全面結算相關指令
 COMPLETE_SETTLEMENT_PATTERN = r'^#全面結算$'
+# v2.8.3 新增：群組總欠款查看
+GROUP_DEBTS_OVERVIEW_PATTERN = r'^#群組欠款$'
+
+def normalize_participants_string(participants_str: str) -> str:
+    """標準化參與人字串用於生成一致的 content_hash - 已被 v2.8.4 更強的標準化取代"""
+    # 提取所有 @提及 和金額組合
+    mentions = re.findall(r'@(\S+)(?:\s+([\d\.]+))?', participants_str)
+    
+    # 按照用戶名稱排序以確保一致性
+    sorted_mentions = sorted(mentions, key=lambda x: x[0])
+    
+    # 重新組合成標準格式
+    normalized_parts = []
+    for name, amount in sorted_mentions:
+        if amount:
+            normalized_parts.append(f"@{name} {amount}")
+        else:
+            normalized_parts.append(f"@{name}")
+    
+    return " ".join(normalized_parts)
 
 def parse_participant_input_v282(participants_str: str, total_bill_amount_from_command: Decimal, payer_mention_name: str) \
         -> Tuple[Optional[List[Tuple[str, Decimal]]], Optional[SplitType], Optional[str], Decimal]:
@@ -212,12 +233,13 @@ def handle_text_message(event: MessageEvent):
             flex_create_bill_match = re.match(FLEX_CREATE_BILL_PATTERN, text)
             flex_menu_match = re.match(FLEX_MENU_PATTERN, text)
             complete_settlement_match = re.match(COMPLETE_SETTLEMENT_PATTERN, text)
+            group_debts_overview_match = re.match(GROUP_DEBTS_OVERVIEW_PATTERN, text)
 
             if add_bill_match:
                 if not sender_mention_name:
                     line_bot_api.reply_message(reply_token, TextSendMessage(text="無法獲取您的群組名稱，請稍後再試。"))
                     return
-                handle_add_bill_v280(reply_token, add_bill_match, group_id, sender_line_user_id, sender_mention_name, db)
+                handle_add_bill_v284(reply_token, add_bill_match, group_id, sender_line_user_id, sender_mention_name, db)
             elif list_bills_match:
                 handle_list_bills_v280(reply_token, group_id, sender_line_user_id, db)
             elif bill_details_match:
@@ -233,13 +255,15 @@ def handle_text_message(event: MessageEvent):
             elif my_debts_match:
                 handle_my_debts_v280(reply_token, sender_line_user_id, group_id, db)
             elif help_match:
-                send_splitbill_help_v282(reply_token)
+                send_splitbill_help_v284(reply_token)
             elif flex_create_bill_match:
                 send_flex_create_bill_menu_v280(reply_token)
             elif flex_menu_match:
-                send_flex_main_menu_v280(reply_token)
+                send_flex_main_menu_v284(reply_token)
             elif complete_settlement_match:
-                handle_complete_settlement_v282(reply_token, group_id, sender_line_user_id, db)
+                handle_complete_settlement_v283(reply_token, group_id, sender_line_user_id, db)
+            elif group_debts_overview_match:
+                handle_group_debts_overview_v283(reply_token, group_id, sender_line_user_id, db)
             else:
                 logger.info(f"分帳Bot: Unmatched command '{text}' in group {group_id}")
 
@@ -259,115 +283,124 @@ def handle_text_message(event: MessageEvent):
         logger.exception(f"分帳Bot 未預期錯誤: {e}")
         line_bot_api.reply_message(reply_token, TextSendMessage(text="發生未預期錯誤，請稍後再試。"))
 
-def handle_add_bill_v280(reply_token: str, match: re.Match, group_id: str, payer_line_user_id: str, payer_mention_name: str, db: Session):
-    """新增帳單功能，加入重複操作防護"""
+def handle_add_bill_v284(reply_token: str, match: re.Match, group_id: str, payer_line_user_id: str, payer_mention_name: str, db: Session):
+    """
+    新增帳單功能 v2.8.4 - 使用資料庫約束徹底防止重複：
+    - 資料庫層面唯一約束
+    - 原子性事務處理
+    - 強化的內容hash生成
+    - 優雅的重複處理
+    """
     total_amount_str = match.group(1)
     description = match.group(2).strip()
     participants_input_str = match.group(3).strip()
 
-    # 生成操作hash用於防止重複操作
-    operation_content = f"add_bill:{total_amount_str}:{description}:{participants_input_str}"
-    operation_hash = generate_operation_hash(payer_line_user_id, "add_bill", operation_content)
-
-    # 檢查是否為重複操作
-    if is_duplicate_operation(db, operation_hash, group_id, payer_line_user_id, time_window_minutes=2):
-        logger.warning(f"偵測到重複新增帳單操作 - 用戶: {payer_line_user_id}, 群組: {group_id}")
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="⚠️ 偵測到重複操作，請稍等片刻再試。"))
-        return
-
-    # 記錄此次操作
-    log_operation(db, operation_hash, group_id, payer_line_user_id, "add_bill")
+    logger.info(f"處理新增帳單請求 - 用戶: {payer_line_user_id}, 群組: {group_id}, 描述: {description}")
 
     if not description:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="請提供支出說明。")); return
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="請提供支出說明。"))
+        return
+        
     try:
         total_bill_amount = Decimal(total_amount_str)
-        if total_bill_amount <= 0: raise ValueError("總支出金額必須大於0。")
+        if total_bill_amount <= 0: 
+            raise ValueError("總支出金額必須大於0。")
     except (InvalidOperation, ValueError) as e:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"總支出金額 '{total_amount_str}' 無效: {e}")); return
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"總支出金額 '{total_amount_str}' 無效: {e}"))
+        return
 
     # 確保付款人存在於該群組中
     payer_member_obj = get_or_create_member_by_line_id(db, line_user_id=payer_line_user_id, group_id=group_id, display_name=payer_mention_name)
 
+    # 解析參與人
     participants_to_charge_data, split_type, error_msg, payer_share = \
         parse_participant_input_v282(participants_input_str, total_bill_amount, payer_mention_name)
 
     if error_msg:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"參與人解析錯誤: {error_msg}")); return
-
-    # 生成內容hash用於防止重複建立相同內容的帳單
-    content_hash = generate_content_hash(payer_member_obj.id, description, total_amount_str, participants_input_str)
-
-    # 檢查是否已存在相同內容的帳單（在過去5分鐘內）
-    cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=5)
-    recent_bill = db.query(Bill).filter(
-        Bill.content_hash == content_hash,
-        Bill.group_id == group_id,
-        Bill.created_at > cutoff_time
-    ).first()
-
-    if recent_bill:
-        logger.warning(f"偵測到重複內容的帳單 - 群組: {group_id}, Hash: {content_hash}")
-        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"⚠️ 偵測到相似的帳單已存在 (B-{recent_bill.id})，請確認是否為重複建立。"))
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=f"參與人解析錯誤: {error_msg}"))
         return
 
-    bill_participants_to_create_db_objects: List[BillParticipant] = []
+    # 生成強化版內容hash
+    content_hash = generate_content_hash_v284(
+        payer_id=payer_member_obj.id,
+        description=description,
+        amount=total_amount_str,
+        participants_str=participants_input_str,
+        group_id=group_id
+    )
+
+    # 準備帳單資料
+    bill_data = {
+        'group_id': group_id,
+        'description': description,
+        'total_bill_amount': total_bill_amount,
+        'payer_member_id': payer_member_obj.id,
+        'split_type': split_type,
+        'content_hash': content_hash
+    }
+
+    # 準備參與人資料
+    participants_data = []
     for p_name, p_amount_owed in participants_to_charge_data:
         debtor_member_obj = get_or_create_member_by_name(db, name=p_name, group_id=group_id)
-        bp = BillParticipant(amount_owed=p_amount_owed, is_paid=False)
-        bp.debtor_member_profile = debtor_member_obj
-        bill_participants_to_create_db_objects.append(bp)
+        participants_data.append({
+            'debtor_member_id': debtor_member_obj.id,
+            'amount_owed': p_amount_owed,
+            'is_paid': False
+        })
 
-    try:
-        db.flush() 
-        new_bill = Bill(
-            group_id=group_id, description=description, total_bill_amount=total_bill_amount,
-            payer_member_id=payer_member_obj.id, split_type=split_type,
-            content_hash=content_hash
-        )
-        db.add(new_bill)
-        for bp_obj in bill_participants_to_create_db_objects:
-            new_bill.participants.append(bp_obj)
-        db.commit()
+    # 使用原子性創建帳單
+    result_bill, status = atomic_create_bill_v284(db, bill_data, participants_data)
 
-        persisted_bill = db.query(Bill).options(
-            joinedload(Bill.payer_member_profile), 
-            joinedload(Bill.participants).joinedload(BillParticipant.debtor_member_profile)
-        ).filter(Bill.id == new_bill.id).first()
-        if not persisted_bill: raise Exception("帳單提交後未能檢索")
-
-        participant_details_msg = [f"@{p_bp.debtor_member_profile.name} 應付 {p_bp.amount_owed:.2f}" for p_bp in persisted_bill.participants]
+    # 處理不同的創建結果
+    if status == "success":
+        # 成功創建新帳單
+        participant_details_msg = [f"@{p_bp.debtor_member_profile.name} 應付 {p_bp.amount_owed:.2f}" for p_bp in result_bill.participants]
         
         # 計算其他人應付的總額
-        others_total = sum(bp.amount_owed for bp in persisted_bill.participants)
+        others_total = sum(bp.amount_owed for bp in result_bill.participants)
         
         reply_msg = (
-            f"✅ 新增支出 B-{persisted_bill.id}！\n名目: {persisted_bill.description}\n"
-            f"付款人: @{persisted_bill.payer_member_profile.name} (您)\n"
-            f"總支出: {persisted_bill.total_bill_amount:.2f}\n"
-            f"類型: {'均攤' if persisted_bill.split_type == SplitType.EQUAL else '分別計算'}\n"
+            f"✅ 新增支出 B-{result_bill.id}！\n名目: {result_bill.description}\n"
+            f"付款人: @{result_bill.payer_member_profile.name} (您)\n"
+            f"總支出: {result_bill.total_bill_amount:.2f}\n"
+            f"類型: {'均攤' if result_bill.split_type == SplitType.EQUAL else '分別計算'}\n"
         )
         
         if payer_share and payer_share > 0:
             reply_msg += f"您的分攤: {payer_share:.2f}\n"
-            reply_msg += f"您實付: {persisted_bill.total_bill_amount:.2f}\n"
+            reply_msg += f"您實付: {result_bill.total_bill_amount:.2f}\n"
             reply_msg += f"應收回: {others_total:.2f}\n"
         
         if participant_details_msg:
             reply_msg += f"明細 ({len(participant_details_msg)}人欠款):\n" + "\n".join(participant_details_msg)
         else:
             reply_msg += "  (此筆支出無其他人需向您付款)"
-        reply_msg += f"\n\n查閱: #支出詳情 B-{persisted_bill.id}"
+        reply_msg += f"\n\n查閱: #支出詳情 B-{result_bill.id}"
+        
         line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_msg))
+        logger.info(f"成功新增帳單 B-{result_bill.id} - 群組: {group_id}, 付款人: {payer_line_user_id}")
 
-        logger.info(f"成功新增帳單 B-{persisted_bill.id} - 群組: {group_id}, 付款人: {payer_line_user_id}")
+    elif status in ["duplicate_found", "duplicate_constraint"]:
+        # 發現重複帳單
+        if result_bill:
+            reply_msg = (
+                f"⚠️ 相同內容的帳單已存在！\n"
+                f"帳單 B-{result_bill.id}: {result_bill.description}\n"
+                f"金額: {result_bill.total_bill_amount:.2f}\n"
+                f"建立時間: {result_bill.created_at.strftime('%m/%d %H:%M') if result_bill.created_at else 'N/A'}\n\n"
+                f"如需查看詳情請使用: #支出詳情 B-{result_bill.id}"
+            )
+        else:
+            reply_msg = "⚠️ 偵測到重複的帳單內容，請稍候再試或修改帳單內容。"
+        
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_msg))
+        logger.warning(f"阻止重複帳單創建 - 群組: {group_id}, 付款人: {payer_line_user_id}, Hash: {content_hash}")
 
-    except IntegrityError as ie:
-        db.rollback(); logger.error(f"DB完整性錯誤(新增支出 v2.8.2): {ie}", exc_info=True)
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="新增支出失敗，重複資料或成員關聯無效。"))
-    except Exception as e:
-        db.rollback(); logger.exception(f"新增支出時意外錯誤 (v2.8.2): {e}")
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="新增支出時發生意外錯誤。"))
+    else:
+        # 其他錯誤
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="新增支出時發生錯誤，請稍後再試。"))
+        logger.error(f"新增帳單失敗 - 狀態: {status}, 群組: {group_id}, 付款人: {payer_line_user_id}")
 
 def handle_list_bills_v280(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
     """列出帳單功能，加入重複操作防護"""
@@ -553,13 +586,14 @@ def handle_my_debts_v280(reply_token: str, sender_line_user_id: str, group_id: s
     full_reply = "\n".join(reply_items)
     line_bot_api.reply_message(reply_token, TextSendMessage(text=full_reply[:4950] + ("..." if len(full_reply)>4950 else "")))
 
-def handle_complete_settlement_v282(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
+def handle_complete_settlement_v283(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
     """
-    全面結算功能 v2.8.2：
+    全面結算功能 v2.8.3：
     - 處理付款人的所有相關帳單
     - 自動封存已結清的帳單
     - 提供完整的結算報告
     - 確保資料庫狀態一致性
+    - 修復封存邏輯問題
     """
     operation_hash = generate_operation_hash(sender_line_user_id, "complete_settlement", group_id)
 
@@ -634,6 +668,11 @@ def handle_complete_settlement_v282(reply_token: str, group_id: str, sender_line
             settlement_summary['total_received'] += bill_received
             settlement_summary['total_pending'] += bill_pending
 
+            # 詳細記錄帳單狀態供除錯
+            logger.info(f"結算檢查 B-{bill.id}: 參與人={total_participants}, 已付={paid_count}, 描述={bill.description}")
+            for p in bill.participants:
+                logger.info(f"  參與人 @{p.debtor_member_profile.name}: 金額={p.amount_owed}, 已付={p.is_paid}")
+
             # 分類帳單狀態
             if total_participants == 0:
                 # 無參與人的帳單（只有付款人）
@@ -644,9 +683,10 @@ def handle_complete_settlement_v282(reply_token: str, group_id: str, sender_line
                 bill.is_archived = True
                 bill.updated_at = datetime.now(timezone.utc)
                 settlement_summary['archived_bills'] += 1
+                logger.info(f"封存帳單 B-{bill.id} (無參與人)")
                 
-            elif paid_count == total_participants:
-                # 已全部付清
+            elif paid_count == total_participants and total_participants > 0:
+                # 已全部付清且有參與人
                 settlement_summary['fully_paid_bills'] += 1
                 settlement_details.append(f"✅ B-{bill.id}: {bill.description[:15]}... (已結清 {bill_received:.2f})")
                 
@@ -654,16 +694,19 @@ def handle_complete_settlement_v282(reply_token: str, group_id: str, sender_line
                 bill.is_archived = True
                 bill.updated_at = datetime.now(timezone.utc)
                 settlement_summary['archived_bills'] += 1
+                logger.info(f"封存帳單 B-{bill.id} (已結清: {paid_count}/{total_participants})")
                 
             elif paid_count > 0:
                 # 部分付清
                 settlement_summary['partially_paid_bills'] += 1
                 settlement_details.append(f"🔄 B-{bill.id}: {bill.description[:15]}... (已收 {bill_received:.2f}/剩餘 {bill_pending:.2f})")
+                logger.info(f"部分結清 B-{bill.id}: {paid_count}/{total_participants}")
                 
             else:
                 # 完全未付
                 settlement_summary['unpaid_bills'] += 1
                 settlement_details.append(f"⭕ B-{bill.id}: {bill.description[:15]}... (待收 {bill_pending:.2f})")
+                logger.info(f"完全未付 B-{bill.id}: {paid_count}/{total_participants}")
 
         # 提交所有更改
         db.commit()
@@ -710,10 +753,10 @@ def handle_complete_settlement_v282(reply_token: str, group_id: str, sender_line
         logger.exception(f"全面結算時發生錯誤 - 用戶: {sender_line_user_id}, 群組: {group_id}: {e}")
         line_bot_api.reply_message(reply_token, TextSendMessage(text="結算過程中發生錯誤，請稍後再試。"))
 
-def send_splitbill_help_v282(reply_token: str):
-    """v2.8.2 更新的幫助訊息"""
+def send_splitbill_help_v284(reply_token: str):
+    """v2.8.4 更新的幫助訊息"""
     help_text = (
-        "--- 💸 分帳機器人指令 (v2.8.2) --- \n\n"
+        "--- 💸 分帳機器人指令 (v2.8.4) --- \n\n"
         "🔸 新增支出 (您自動參與分攤):\n"
         "  `#新增支出 <總金額> <說明> @參與人A @參與人B...` (均攤)\n"
         "    例: `#新增支出 300 午餐 @小美 @小王`\n"
@@ -726,20 +769,20 @@ def send_splitbill_help_v282(reply_token: str):
         "  • 不需要@自己（LINE不支援）\n"
         "  • 專注於群組成員間的債務計算\n\n"
         "🔸 視覺化選單:\n  `#選單` - 主選單\n  `#建立帳單` - 帳單建立精靈\n\n"
-        "🔸 查看功能:\n  `#帳單列表` - 查看所有帳單\n  `#支出詳情 B-ID` - 查看特定帳單\n  `#我的欠款` - 查看個人未付款項\n\n"
+        "🔸 查看功能:\n  `#帳單列表` - 查看所有帳單\n  `#支出詳情 B-ID` - 查看特定帳單\n  `#我的欠款` - 查看個人未付款項\n  `#群組欠款` - 查看群組所有成員欠款總覽\n\n"
         "🔸 結算功能:\n  `#結帳 B-ID @已付成員1 @成員2...` - 標記個別付款\n  `#全面結算` - 智慧結算所有帳單並自動封存\n  `#封存帳單 B-ID` - 手動封存帳單\n\n"
         "🔸 本說明:\n  `#幫助`\n\n"
-        "✨ v2.8.2 新功能:\n"
-        "- 🎯 純粹的群組分帳計算邏輯\n"
-        "- 🚫 移除@自己相關的多餘程式碼\n"
-        "- 💰 全面結算功能：一鍵處理所有帳單\n"
-        "- 🔒 強化的資料庫完整性和一致性\n"
-        "- 🛡️ 完善的記帳到結帳工作流程"
+        "🚀 v2.8.4 重大更新:\n"
+        "- 🔒 資料庫層面唯一約束：徹底防止重複帳單\n"
+        "- ⚡ 原子性事務處理：確保資料一致性\n"
+        "- 🧮 強化內容hash：智慧標準化所有輸入\n"
+        "- 🛡️ 競爭條件保護：解決併發請求問題\n"
+        "- 🎯 根本性解決方案：不再依賴時間窗口"
     )
     line_bot_api.reply_message(reply_token, TextSendMessage(text=help_text))
 
-def send_flex_main_menu_v280(reply_token: str):
-    """發送主選單Flex Message"""
+def send_flex_main_menu_v284(reply_token: str):
+    """發送主選單Flex Message v2.8.4"""
     flex_message = {
         "type": "bubble",
         "header": {
@@ -755,7 +798,7 @@ def send_flex_main_menu_v280(reply_token: str):
                 },
                 {
                     "type": "text",
-                    "text": "v2.8.2",
+                    "text": "v2.8.4",
                     "size": "sm",
                     "color": "#666666"
                 }
@@ -807,14 +850,33 @@ def send_flex_main_menu_v280(reply_token: str):
                     }
                 },
                 {
-                    "type": "button",
-                    "style": "secondary",
-                    "height": "sm",
-                    "action": {
-                        "type": "message",
-                        "label": "💰 我的欠款",
-                        "text": "#我的欠款"
-                    }
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        {
+                            "type": "button",
+                            "style": "secondary",
+                            "height": "sm",
+                            "action": {
+                                "type": "message",
+                                "label": "💰 我的欠款",
+                                "text": "#我的欠款"
+                            },
+                            "flex": 1
+                        },
+                        {
+                            "type": "button",
+                            "style": "secondary",
+                            "height": "sm",
+                            "action": {
+                                "type": "message",
+                                "label": "👥 群組欠款",
+                                "text": "#群組欠款"
+                            },
+                            "flex": 1
+                        }
+                    ]
                 },
                 {
                     "type": "button",
@@ -1019,10 +1081,95 @@ def send_flex_create_bill_menu_v280(reply_token: str):
         FlexSendMessage(alt_text="建立帳單選單", contents=flex_message)
     )
 
+def handle_group_debts_overview_v283(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
+    """群組總欠款查看功能 - 顯示群組中所有成員的欠款狀況"""
+    operation_hash = generate_operation_hash(sender_line_user_id, "group_debts_overview", group_id)
+
+    if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
+        return  # 靜默忽略重複的群組欠款查詢
+
+    log_operation(db, operation_hash, group_id, sender_line_user_id, "group_debts_overview")
+
+    # 查詢群組中所有未付款的債務記錄
+    all_unpaid_participations = db.query(BillParticipant).options(
+        joinedload(BillParticipant.debtor_member_profile),
+        joinedload(BillParticipant.bill).joinedload(Bill.payer_member_profile)
+    ).join(Bill).filter(
+        Bill.group_id == group_id,
+        Bill.is_archived == False,
+        BillParticipant.is_paid == False
+    ).order_by(BillParticipant.debtor_member_id, Bill.created_at).all()
+
+    if not all_unpaid_participations:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text="🎉 群組內目前無任何未結清欠款！"))
+        return
+
+    # 按債務人整理欠款資訊
+    debts_by_member = {}
+    total_group_debt = Decimal(0)
+    
+    for participation in all_unpaid_participations:
+        debtor_name = participation.debtor_member_profile.name
+        if debtor_name not in debts_by_member:
+            debts_by_member[debtor_name] = {
+                'total_owed': Decimal(0),
+                'bills': []
+            }
+        
+        debts_by_member[debtor_name]['total_owed'] += participation.amount_owed
+        debts_by_member[debtor_name]['bills'].append({
+            'bill_id': participation.bill.id,
+            'description': participation.bill.description,
+            'amount_owed': participation.amount_owed,
+            'payer_name': participation.bill.payer_member_profile.name
+        })
+        total_group_debt += participation.amount_owed
+
+    # 生成報告
+    reply_lines = [
+        "--- 💰 群組欠款總覽 ---",
+        f"",
+        f"📊 總計摘要:",
+        f"• 欠款成員: {len(debts_by_member)} 人",
+        f"• 群組總欠款: {total_group_debt:.2f}",
+        f"",
+        f"📋 欠款詳情:"
+    ]
+
+    # 按欠款金額排序（從高到低）
+    sorted_debtors = sorted(debts_by_member.items(), key=lambda x: x[1]['total_owed'], reverse=True)
+    
+    for debtor_name, debt_info in sorted_debtors[:8]:  # 限制顯示前8名避免訊息過長
+        reply_lines.append(f"")
+        reply_lines.append(f"👤 @{debtor_name}")
+        reply_lines.append(f"  欠款總額: {debt_info['total_owed']:.2f}")
+        
+        # 顯示該成員的前3筆欠款
+        for bill_info in debt_info['bills'][:3]:
+            reply_lines.append(f"  • B-{bill_info['bill_id']}: {bill_info['description'][:12]}...")
+            reply_lines.append(f"    欠 @{bill_info['payer_name']}: {bill_info['amount_owed']:.2f}")
+        
+        if len(debt_info['bills']) > 3:
+            reply_lines.append(f"    ... 及其他 {len(debt_info['bills']) - 3} 筆欠款")
+
+    if len(sorted_debtors) > 8:
+        reply_lines.append(f"")
+        reply_lines.append(f"... 及其他 {len(sorted_debtors) - 8} 位成員")
+
+    reply_lines.extend([
+        f"",
+        f"💡 提示:",
+        f"• 使用 #我的欠款 查看個人詳細欠款",
+        f"• 使用 #帳單列表 查看所有帳單"
+    ])
+
+    full_reply = "\n".join(reply_lines)
+    line_bot_api.reply_message(reply_token, TextSendMessage(text=full_reply[:4950] + ("..." if len(full_reply)>4950 else "")))
+
 if __name__ == "__main__":
     port = int(os.environ.get('PORT', 7777)) 
     host = '0.0.0.0'
-    logger.info(f"分帳Bot Flask 應用 (開發伺服器 v2.8.2) 啟動於 host={host}, port={port}")
+    logger.info(f"分帳Bot Flask 應用 (開發伺服器 v2.8.4) 啟動於 host={host}, port={port}")
     try:
         app.run(host=host, port=port, debug=True) 
     except Exception as e:

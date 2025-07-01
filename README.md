@@ -217,73 +217,12 @@ sb_duplicate_prevention_log (
 - PostgreSQL 12+
 - LINE Bot Channel
 
-### 本地開發
-
-1. **克隆專案**
-
-   ```bash
-   git clone https://github.com/yourusername/line-split-bot.git
-   cd line-split-bot
-   ```
-
-2. **安裝依賴**
-
-   ```bash
-   pip install -r requirements.txt
-   # 或使用 Poetry
-   poetry install
-   ```
-
-3. **環境設定**
-
-   ```bash
-   # 創建 .env 檔案
-   LINE_CHANNEL_ACCESS_TOKEN=your_channel_access_token
-   LINE_CHANNEL_SECRET=your_channel_secret
-   DATABASE_URL_SPLITBILL=postgresql://user:password@localhost/splitbill_db
-   ```
-
-4. **初始化資料庫**
-
-   ```bash
-   python -c "from models_splitbill import init_db_splitbill; init_db_splitbill()"
-   ```
-
-5. **啟動服務**
-
-   ```bash
-   python app_splitbill.py
-   ```
-
-### 生產環境部署
-
-1. **使用 Heroku**
-
-   ```bash
-   heroku create your-app-name
-   heroku addons:create heroku-postgresql:hobby-dev
-   heroku config:set LINE_CHANNEL_ACCESS_TOKEN=your_token
-   heroku config:set LINE_CHANNEL_SECRET=your_secret
-   git push heroku main
-   ```
-
-2. **使用 Railway**
-
-   ```bash
-   railway login
-   railway new
-   railway add postgresql
-   railway deploy
-   ```
-
 ### LINE Bot 設定
 
 1. 在 [LINE Developers Console](https://developers.line.biz/) 建立新的 Provider 和 Channel
 2. 取得 Channel Access Token 和 Channel Secret
 3. 設定 Webhook URL：`https://your-domain.com/splitbill/callback`
 4. 啟用 Webhook 接收訊息
-
-## 🧪 測試
 
 ### 執行完整測試套件
 
