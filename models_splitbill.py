@@ -1,4 +1,4 @@
-# models_splitbill.py (v1.0.4 - 移除我的欠款，優化群組欠款)
+# models_splitbill.py (v1.0.5 - 重新設計功能架構)
 import os
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, DateTime, ForeignKey,
