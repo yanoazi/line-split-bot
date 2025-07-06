@@ -1,4 +1,4 @@
-# app_splitbill.py (v1.0.2 - 重複帳單修復版)
+# app_splitbill.py (v1.0.4 - 移除我的欠款，優化群組欠款)
 from flask import Flask, request, abort, jsonify
 import os
 import re
@@ -17,7 +17,6 @@ from models_splitbill import (
     get_or_create_member_by_line_id, 
     get_or_create_member_by_name,    
     get_bill_by_id, get_active_bills_by_group,
-    get_unpaid_debts_for_member_by_line_id,
     generate_content_hash_v284, generate_operation_hash,
     is_duplicate_operation, log_operation, cleanup_old_duplicate_logs,
     atomic_create_bill_v284
@@ -48,14 +47,14 @@ if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
 try:
     line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
     handler = WebhookHandler(LINE_CHANNEL_SECRET)
-    logger.info("LINE Bot API 初始化成功 (v1.0.2 - 重複帳單修復版)。")
+    logger.info("LINE Bot API 初始化成功 (v1.0.4 - 移除我的欠款，優化群組欠款)。")
 except Exception as e:
     logger.exception(f"初始化 LINE SDK 失敗: {e}")
     exit(1)
 
 try:
     init_db()
-    logger.info("分帳資料庫初始化檢查完成 (v1.0.2 - 重複帳單修復版)。")
+    logger.info("分帳資料庫初始化檢查完成 (v1.0.4 - 移除我的欠款，優化群組欠款)。")
 except Exception as e:
     logger.exception(f"分帳資料庫初始化失敗: {e}")
 
@@ -64,7 +63,6 @@ ADD_BILL_PATTERN = r'^#新增支出\s+([\d\.]+)\s+(.+?)\s+((?:@\S+(?:\s+[\d\.]+)
 LIST_BILLS_PATTERN = r'^#帳單列表$'
 BILL_DETAILS_PATTERN = r'^#支出詳情\s+B-(\d+)$'
 SETTLE_PAYMENT_PATTERN = r'^#結帳\s+B-(\d+)\s+((?:@\S+\s*)+)$'
-MY_DEBTS_PATTERN = r'^#我的欠款$'
 HELP_PATTERN = r'^#幫助$'
 # 新增Flex Message相關的指令
 FLEX_CREATE_BILL_PATTERN = r'^#建立帳單$'
@@ -230,7 +228,6 @@ def handle_text_message(event: MessageEvent):
             list_bills_match = re.match(LIST_BILLS_PATTERN, text)
             bill_details_match = re.match(BILL_DETAILS_PATTERN, text)
             settle_payment_match = re.match(SETTLE_PAYMENT_PATTERN, text)
-            my_debts_match = re.match(MY_DEBTS_PATTERN, text)
             help_match = re.match(HELP_PATTERN, text)
             flex_create_bill_match = re.match(FLEX_CREATE_BILL_PATTERN, text)
             flex_menu_match = re.match(FLEX_MENU_PATTERN, text)
@@ -253,8 +250,6 @@ def handle_text_message(event: MessageEvent):
                 bill_db_id = int(settle_payment_match.group(1))
                 debtor_mentions_str = settle_payment_match.group(2)
                 handle_settle_payment_v280(reply_token, bill_db_id, debtor_mentions_str, group_id, sender_line_user_id, db)
-            elif my_debts_match:
-                handle_my_debts_v280(reply_token, sender_line_user_id, group_id, db)
             elif help_match:
                 send_splitbill_help_v284(reply_token)
             elif flex_create_bill_match:
@@ -780,241 +775,7 @@ def handle_settle_payment_v280(reply_token: str, bill_db_id: int, debtor_mention
 
 
 
-def handle_my_debts_v280(reply_token: str, sender_line_user_id: str, group_id: str, db: Session):
-    """我的欠款功能，使用Flex Message呈現"""
-    operation_hash = generate_operation_hash(sender_line_user_id, "my_debts", group_id)
 
-    if is_duplicate_operation(db, operation_hash, group_id, sender_line_user_id, time_window_minutes=1):
-        return  # 靜默忽略重複的欠款查詢
-
-    log_operation(db, operation_hash, group_id, sender_line_user_id, "my_debts")
-
-    unpaid_participations = get_unpaid_debts_for_member_by_line_id(db, sender_line_user_id, group_id)
-
-    sender_display_name_for_msg = "您"
-    try:
-        profile = line_bot_api.get_group_member_profile(group_id, sender_line_user_id)
-        sender_display_name_for_msg = profile.display_name
-    except Exception: 
-        logger.warning(f"無法獲取 {sender_line_user_id} 在群組 {group_id} 的名稱用於 #我的欠款 回覆。")
-
-    if not unpaid_participations:
-        # 無欠款的Flex Message
-        flex_message = {
-            "type": "bubble",
-            "header": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [
-                    {
-                        "type": "text",
-                        "text": "💰 我的欠款",
-                        "weight": "bold",
-                        "size": "xl",
-                        "color": "#4CAF50"
-                    }
-                ],
-                "paddingAll": "20px",
-                "backgroundColor": "#E8F5E8"
-            },
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [
-                    {
-                        "type": "box",
-                        "layout": "vertical",
-                        "contents": [
-                            {
-                                "type": "text",
-                                "text": "🎉",
-                                "size": "xxl",
-                                "align": "center",
-                                "margin": "md"
-                            },
-                            {
-                                "type": "text",
-                                "text": "太棒了！",
-                                "size": "lg",
-                                "weight": "bold",
-                                "align": "center",
-                                "color": "#4CAF50",
-                                "margin": "md"
-                            },
-                            {
-                                "type": "text",
-                                "text": "您目前沒有任何未付款項",
-                                "size": "md",
-                                "align": "center",
-                                "color": "#666666",
-                                "wrap": True,
-                                "margin": "md"
-                            }
-                        ],
-                        "backgroundColor": "#F5F5F5",
-                        "paddingAll": "20px",
-                        "cornerRadius": "10px"
-                    }
-                ],
-                "paddingAll": "20px"
-            }
-        }
-        line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text="我的欠款 - 無未付款項", contents=flex_message))
-        return
-
-    # 計算總欠款
-    total_owed_all_bills = sum(bp.amount_owed for bp in unpaid_participations)
-    
-    # 構建欠款清單（最多顯示8筆）
-    debt_contents = []
-    for i, bp in enumerate(unpaid_participations[:8]):
-        if i > 0:
-            debt_contents.append({"type": "separator", "margin": "md"})
-        
-        debt_contents.extend([
-            {
-                "type": "box",
-                "layout": "horizontal",
-                "contents": [
-                    {
-                        "type": "text",
-                        "text": f"B-{bp.bill.id}",
-                        "size": "sm",
-                        "color": "#FF9800",
-                        "weight": "bold",
-                        "flex": 1
-                    },
-                    {
-                        "type": "text",
-                        "text": f"${int(bp.amount_owed)}",
-                        "size": "md",
-                        "color": "#F44336",
-                        "weight": "bold",
-                        "align": "end",
-                        "flex": 1
-                    }
-                ],
-                "margin": "sm"
-            },
-            {
-                "type": "text",
-                "text": bp.bill.description[:20] + ("..." if len(bp.bill.description) > 20 else ""),
-                "size": "xs",
-                "color": "#666666",
-                "margin": "xs"
-            },
-            {
-                "type": "text",
-                "text": f"欠 @{bp.bill.payer_member_profile.name}",
-                "size": "xs",
-                "color": "#999999",
-                "margin": "xs"
-            }
-        ])
-    
-    if len(unpaid_participations) > 8:
-        debt_contents.extend([
-            {"type": "separator", "margin": "md"},
-            {
-                "type": "text",
-                "text": f"... 還有 {len(unpaid_participations) - 8} 筆欠款",
-                "size": "xs",
-                "color": "#999999",
-                "align": "center",
-                "margin": "sm"
-            }
-        ])
-
-    flex_message = {
-        "type": "bubble",
-        "header": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "💸 我的欠款",
-                    "weight": "bold",
-                    "size": "xl",
-                    "color": "#F44336"
-                },
-                {
-                    "type": "text",
-                    "text": f"@{sender_display_name_for_msg}",
-                    "size": "sm",
-                    "color": "#666666"
-                }
-            ],
-            "paddingAll": "20px",
-            "backgroundColor": "#FFEBEE"
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": "總欠款",
-                            "size": "md",
-                            "color": "#333333",
-                            "flex": 1
-                        },
-                        {
-                            "type": "text",
-                            "text": f"${int(total_owed_all_bills)}",
-                            "size": "xl",
-                            "color": "#F44336",
-                            "weight": "bold",
-                            "align": "end",
-                            "flex": 1
-                        }
-                    ],
-                    "backgroundColor": "#FFF3E0",
-                    "paddingAll": "15px",
-                    "cornerRadius": "8px",
-                    "margin": "md"
-                },
-                {
-                    "type": "text",
-                    "text": "明細清單",
-                    "size": "md",
-                    "weight": "bold",
-                    "margin": "xl"
-                },
-                {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": debt_contents,
-                    "backgroundColor": "#F5F5F5",
-                    "paddingAll": "15px",
-                    "cornerRadius": "8px",
-                    "margin": "md"
-                }
-            ],
-            "paddingAll": "20px"
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "💡 使用 #支出詳情 B-ID 查看帳單詳情",
-                    "size": "xs",
-                    "color": "#999999",
-                    "align": "center",
-                    "wrap": True
-                }
-            ],
-            "paddingAll": "15px"
-        }
-    }
-    
-    line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text=f"我的欠款 - 總計 ${int(total_owed_all_bills)}", contents=flex_message))
 
 def handle_personal_settlement_v285(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
     """
@@ -1291,9 +1052,9 @@ def handle_group_settlement_v285(reply_token: str, group_id: str, sender_line_us
         line_bot_api.reply_message(reply_token, TextSendMessage(text="結算過程中發生錯誤，請稍後再試。"))
 
 def send_splitbill_help_v284(reply_token: str):
-    """v1.0 更新的幫助訊息 - 簡化功能，付款即結算刪除"""
+    """v1.0.4 更新的幫助訊息 - 移除我的欠款功能"""
     help_text = (
-        "--- 💸 分帳機器人指令 (v1.0) --- \n\n"
+        "--- 💸 分帳機器人指令 (v1.0.4) --- \n\n"
         "🔸 新增支出 (可以隔行輸入):\n"
         "#新增支出 <總金額> <說明> @參與人A @參與人B... (均攤；付款人會自動參與分攤)\n"
         "例: #新增支出 300 午餐 @小美 @小王\n"
@@ -1310,7 +1071,7 @@ def send_splitbill_help_v284(reply_token: str):
         "• 不需要@自己（LINE不支援）\n"
         "• 金額分攤採無條件進位至整數\n\n"
         "🔸 視覺化選單:\n  #選單 - 主選單\n  #建立帳單 - 帳單建立精靈\n"
-        "🔸 查看功能:\n  #帳單列表 - 查看帳單概要\n  #完整帳單 - 查看所有帳單完整詳情\n  #支出詳情 B-ID - 查看特定帳單\n  #我的欠款 - 查看個人未付款項\n  #群組欠款 - 查看群組所有成員欠款\n"
+        "🔸 查看功能:\n  #帳單列表 - 查看帳單概要\n  #完整帳單 - 查看所有帳單完整詳情\n  #支出詳情 B-ID - 查看特定帳單\n  #群組欠款 - 查看群組所有成員欠款（含個人明細）\n"
         "🔸 結算功能:\n  #結帳 B-ID @成員1 @成員2... - 付款結算並刪除\n  #個人結算 - 刪除個人所有付款帳單\n  #群組結算 - 刪除群組所有帳單\n\n"
         "⚠️ 重要：付款 = 結算 = 刪除帳單\n所有結算操作會永久刪除記錄，無法復原\n\n"
         "🔸 本說明:\n  #幫助"
@@ -1334,7 +1095,7 @@ def send_flex_main_menu_v285(reply_token: str):
                 },
                 {
                     "type": "text",
-                    "text": "v1.0",
+                    "text": "v1.0.4",
                     "size": "sm",
                     "color": "#666666"
                 }
@@ -1405,33 +1166,14 @@ def send_flex_main_menu_v285(reply_token: str):
                     ]
                 },
                 {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "spacing": "sm",
-                    "contents": [
-                        {
-                            "type": "button",
-                            "style": "secondary",
-                            "height": "sm",
-                            "action": {
-                                "type": "message",
-                                "label": "💰 我的欠款",
-                                "text": "#我的欠款"
-                            },
-                            "flex": 1
-                        },
-                        {
-                            "type": "button",
-                            "style": "secondary",
-                            "height": "sm",
-                            "action": {
-                                "type": "message",
-                                "label": "👥 群組欠款",
-                                "text": "#群組欠款"
-                            },
-                            "flex": 1
-                        }
-                    ]
+                    "type": "button",
+                    "style": "secondary",
+                    "height": "sm",
+                    "action": {
+                        "type": "message",
+                        "label": "👥 群組欠款",
+                        "text": "#群組欠款"
+                    }
                 },
                 {
                     "type": "box",
@@ -1677,67 +1419,16 @@ def handle_group_debts_overview_v283(reply_token: str, group_id: str, sender_lin
     ).order_by(BillParticipant.debtor_member_id, Bill.created_at).all()
 
     if not all_unpaid_participations:
-        # 無欠款的Flex Message
-        flex_message = {
-            "type": "bubble",
-            "header": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [
-                    {
-                        "type": "text",
-                        "text": "👥 群組欠款",
-                        "weight": "bold",
-                        "size": "xl",
-                        "color": "#4CAF50"
-                    }
-                ],
-                "paddingAll": "20px",
-                "backgroundColor": "#E8F5E8"
-            },
-            "body": {
-                "type": "box",
-                "layout": "vertical",
-                "contents": [
-                    {
-                        "type": "box",
-                        "layout": "vertical",
-                        "contents": [
-                            {
-                                "type": "text",
-                                "text": "🎉",
-                                "size": "xxl",
-                                "align": "center",
-                                "margin": "md"
-                            },
-                            {
-                                "type": "text",
-                                "text": "群組結清！",
-                                "size": "lg",
-                                "weight": "bold",
-                                "align": "center",
-                                "color": "#4CAF50",
-                                "margin": "md"
-                            },
-                            {
-                                "type": "text",
-                                "text": "目前群組內無任何未結清欠款",
-                                "size": "md",
-                                "align": "center",
-                                "color": "#666666",
-                                "wrap": True,
-                                "margin": "md"
-                            }
-                        ],
-                        "backgroundColor": "#F5F5F5",
-                        "paddingAll": "20px",
-                        "cornerRadius": "10px"
-                    }
-                ],
-                "paddingAll": "20px"
-            }
-        }
-        line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text="群組欠款 - 無未結清欠款", contents=flex_message))
+        reply_text = (
+            "🎉 群組欠款總覽\n"
+            "═════════════════════\n"
+            "\n"
+            "✨ 群組結清！\n"
+            "目前群組內無任何未結清欠款\n"
+            "\n"
+            "💡 使用 #帳單列表 查看所有帳單"
+        )
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
         return
 
     # 按債務人整理欠款資訊
@@ -1764,183 +1455,75 @@ def handle_group_debts_overview_v283(reply_token: str, group_id: str, sender_lin
     # 按欠款金額排序（從高到低）
     sorted_debtors = sorted(debts_by_member.items(), key=lambda x: x[1]['total_owed'], reverse=True)
     
-    # 構建成員欠款清單（最多顯示6人）
-    member_contents = []
-    for i, (debtor_name, debt_info) in enumerate(sorted_debtors[:6]):
+    # 構建文字訊息
+    reply_lines = [
+        "👥 群組欠款總覽",
+        "═════════════════════",
+        f"💰 總欠款：${int(total_group_debt)}",
+        f"👤 欠款人數：{len(debts_by_member)} 人",
+        ""
+    ]
+    
+    # 添加成員欠款明細
+    for i, (debtor_name, debt_info) in enumerate(sorted_debtors):
         if i > 0:
-            member_contents.append({"type": "separator", "margin": "md"})
+            reply_lines.append("─────────────────────")
         
-        # 成員欠款框
-        member_box = {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": f"@{debtor_name}",
-                            "size": "md",
-                            "color": "#333333",
-                            "weight": "bold",
-                            "flex": 2
-                        },
-                        {
-                            "type": "text",
-                            "text": f"${int(debt_info['total_owed'])}",
-                            "size": "lg",
-                            "color": "#F44336",
-                            "weight": "bold",
-                            "align": "end",
-                            "flex": 1
-                        }
-                    ]
-                }
-            ],
-            "backgroundColor": "#FAFAFA",
-            "paddingAll": "12px",
-            "cornerRadius": "8px",
-            "margin": "sm"
-        }
+        # 成員欠款標題
+        reply_lines.append(f"💸 @{debtor_name} - ${int(debt_info['total_owed'])}")
         
-        # 添加該成員的帳單詳情（最多2筆）
-        bill_details = []
-        for bill_info in debt_info['bills'][:2]:
-            bill_details.append({
-                "type": "text",
-                "text": f"B-{bill_info['bill_id']}: {bill_info['description'][:15]}{'...' if len(bill_info['description']) > 15 else ''}",
-                "size": "xs",
-                "color": "#666666",
-                "margin": "xs"
-            })
-            bill_details.append({
-                "type": "text",
-                "text": f"欠 @{bill_info['payer_name']}: ${int(bill_info['amount_owed'])}",
-                "size": "xs",
-                "color": "#999999",
-                "margin": "xs"
-            })
-        
-        if len(debt_info['bills']) > 2:
-            bill_details.append({
-                "type": "text",
-                "text": f"... 及其他 {len(debt_info['bills']) - 2} 筆",
-                "size": "xs",
-                "color": "#999999",
-                "margin": "xs"
-            })
-        
-        member_box["contents"].extend(bill_details)
-        member_contents.append(member_box)
+        # 完整顯示該成員的所有帳單詳情
+        for bill_info in debt_info['bills']:
+            # 縮短描述，但保留更多字元
+            short_desc = bill_info['description'][:15] + ("..." if len(bill_info['description']) > 15 else "")
+            reply_lines.append(f"  B-{bill_info['bill_id']}: {short_desc}")
+            reply_lines.append(f"  欠 @{bill_info['payer_name']}: ${int(bill_info['amount_owed'])}")
     
-    if len(sorted_debtors) > 6:
-        member_contents.extend([
-            {"type": "separator", "margin": "md"},
-            {
-                "type": "text",
-                "text": f"... 還有 {len(sorted_debtors) - 6} 位成員有欠款",
-                "size": "xs",
-                "color": "#999999",
-                "align": "center",
-                "margin": "sm"
-            }
-        ])
-
-    flex_message = {
-        "type": "bubble",
-        "header": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "👥 群組欠款總覽",
-                    "weight": "bold",
-                    "size": "xl",
-                    "color": "#FF9800"
-                },
-                {
-                    "type": "box",
-                    "layout": "horizontal",
-                    "contents": [
-                        {
-                            "type": "text",
-                            "text": f"{len(debts_by_member)} 人有欠款",
-                            "size": "sm",
-                            "color": "#666666",
-                            "flex": 1
-                        },
-                        {
-                            "type": "text",
-                            "text": f"總額 ${int(total_group_debt)}",
-                            "size": "sm",
-                            "color": "#F44336",
-                            "weight": "bold",
-                            "align": "end",
-                            "flex": 1
-                        }
-                    ],
-                    "margin": "sm"
-                }
-            ],
-            "paddingAll": "20px",
-            "backgroundColor": "#FFF3E0"
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "成員欠款明細 (按金額排序)",
-                    "size": "md",
-                    "weight": "bold",
-                    "margin": "md"
-                },
-                {
-                    "type": "box",
-                    "layout": "vertical",
-                    "contents": member_contents,
-                    "margin": "md"
-                }
-            ],
-            "paddingAll": "20px"
-        },
-        "footer": {
-            "type": "box",
-            "layout": "horizontal",
-            "spacing": "sm",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "height": "sm",
-                    "action": {
-                        "type": "message",
-                        "label": "💸 我的欠款",
-                        "text": "#我的欠款"
-                    },
-                    "flex": 1
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "height": "sm",
-                    "action": {
-                        "type": "message",
-                        "label": "📋 帳單列表",
-                        "text": "#帳單列表"
-                    },
-                    "flex": 1
-                }
-            ],
-            "paddingAll": "15px"
-        }
-    }
+    reply_lines.extend([
+        "",
+        "═════════════════════",
+        "💡 使用 #支出詳情 B-ID 查看帳單詳情",
+        "💡 查看個人欠款請參考群組欠款總覽"
+    ])
     
-    line_bot_api.reply_message(reply_token, FlexSendMessage(alt_text=f"群組欠款總覽 - ${int(total_group_debt)}", contents=flex_message))
+    reply_text = "\n".join(reply_lines)
+    
+    # 處理長訊息分割（LINE限制約5000字元）
+    max_length = 4500
+    if len(reply_text) <= max_length:
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=reply_text))
+    else:
+        # 分割訊息處理
+        parts = []
+        current_part = ""
+        
+        for line in reply_lines:
+            if len(current_part + line + "\n") > max_length:
+                if current_part:
+                    parts.append(current_part.strip())
+                    current_part = line + "\n"
+                else:
+                    # 單行過長，強制截斷
+                    parts.append(line[:max_length-10] + "...")
+            else:
+                current_part += line + "\n"
+        
+        if current_part:
+            parts.append(current_part.strip())
+        
+        # 發送第一部分並提示
+        first_part = parts[0] + f"\n\n📄 訊息過長，已分割 ({len(parts)} 部分)"
+        line_bot_api.reply_message(reply_token, TextSendMessage(text=first_part))
+        
+        # 發送其餘部分（延遲發送避免過於頻繁）
+        import time
+        for i, part in enumerate(parts[1:], 2):
+            time.sleep(0.5)  # 避免訊息發送過快
+            header = f"📄 第 {i} 部分 / 共 {len(parts)} 部分\n" + "=" * 20 + "\n"
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=header + part))
+            except Exception as e:
+                logger.warning(f"發送群組欠款第{i}部分失敗: {e}")
 
 def handle_complete_bills_list_v1(reply_token: str, group_id: str, sender_line_user_id: str, db: Session):
     """完整帳單列表功能 - 顯示所有帳單及完整欠款詳情（無限制）"""

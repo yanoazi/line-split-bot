@@ -1,4 +1,4 @@
-# models_splitbill.py (v1.0 - Fixed Group Isolation & Duplicate Prevention)
+# models_splitbill.py (v1.0.4 - 移除我的欠款，優化群組欠款)
 import os
 from sqlalchemy import (
     create_engine, Column, Integer, String, Text, DateTime, ForeignKey,
@@ -316,33 +316,7 @@ def get_active_bills_by_group(db: Session, group_id: str) -> List[Bill]:
         Bill.is_archived == False
     ).order_by(Bill.created_at.desc()).all()
 
-def get_unpaid_debts_for_member_by_line_id(db: Session, line_user_id: str, group_id: str) -> List[BillParticipant]:
-    """
-    獲取特定群組中成員的未付款項
-    修復：確保查詢範圍限定在特定群組內
-    """
-    # 先在特定群組中找到該成員
-    member = db.query(GroupMember).filter(
-        GroupMember.line_user_id == line_user_id,
-        GroupMember.group_id == group_id
-    ).first()
 
-    if not member:
-        return []
-
-    return db.query(BillParticipant)\
-        .join(BillParticipant.bill)\
-        .options(
-            joinedload(BillParticipant.bill).joinedload(Bill.payer_member_profile),
-        )\
-        .filter(
-            BillParticipant.debtor_member_id == member.id,
-            BillParticipant.is_paid == False,
-            Bill.group_id == group_id,  # 確保限定在特定群組
-            Bill.is_archived == False
-        )\
-        .order_by(Bill.created_at.asc())\
-        .all()
 
 def cleanup_old_duplicate_logs(db: Session, days_to_keep: int = 7):
     """清理舊的重複操作記錄"""
